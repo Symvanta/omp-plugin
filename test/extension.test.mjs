@@ -1038,3 +1038,304 @@ test("a full session flow makes no network call", async () => {
 
   assert.equal(calls, 0, "the extension must not use the network");
 });
+
+// ------------------------------------------------------------- XD write devices
+
+/**
+ * The write-device call a harness without mounted MCP tools uses: `write` to an
+ * `xd://mcp__symvanta_*` path, with the tool's JSON arguments as the write
+ * content. The extension unwraps it into the same logical invocation a mounted
+ * MCP tool produces, so the status widget, the attachment observation, and the
+ * impact gate all read it.
+ */
+function xdWrite(tool, args, { callId = "x1", path, content } = {}) {
+  return {
+    toolName: "write",
+    toolCallId: callId,
+    input: {
+      path: path ?? `xd://mcp__symvanta_${tool}`,
+      content: content ?? JSON.stringify(args ?? {}),
+    },
+  };
+}
+
+/** The bridged result for one `xd://` write call: the device's payload on `details`. */
+function xdResult(tool, args, { callId = "x1", path, content, details, isError = false, blocks } = {}) {
+  return { ...xdWrite(tool, args, { callId, path, content }), details, isError, content: blocks };
+}
+
+test("a bridged init result feeds the status bar and widget, records attachment, and arms the gate", async () => {
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    // The write-device harness mounts no Symvanta MCP tools: the bridge is the
+    // only path to the graph, and a successful bridged init is what proves it.
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+
+    const [scheduled] = await app.emit("tool_call", xdWrite("init", { repository: "Symvanta/omp-plugin" }, { callId: "i1" }));
+    assert.equal(scheduled, undefined, "the bridged call itself is not gated");
+    assert.deepEqual(app.statusWrites(), [], "nothing is observed before the write returns");
+
+    await app.emit("tool_result", xdResult("init", { repository: "Symvanta/omp-plugin" }, {
+      callId: "i1",
+      details: {
+        workspace: { repository: "Symvanta/omp-plugin", attached: true },
+        project: { name: "omp-plugin" },
+        repositories: [{}],
+      },
+    }));
+
+    assert.equal(app.statusWrites().length, 1, "a bridged init feeds the status bar");
+    assert.equal(app.statusWrites()[0].key, STATUS_KEY);
+    assert.match(app.statusWrites()[0].text, /^symvanta: omp-plugin · attached$/);
+    assert.equal(app.widgetWrites().length, 1, "and the below-editor widget");
+    assert.equal(app.widgetWrites()[0].options.placement, "belowEditor");
+
+    const [blocked] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(blocked?.block, true, "the bridged attachment observation arms the guard");
+    assert.match(
+      blocked.reason,
+      /relate|estimate_scope/,
+      "the bridge proved the tools are reachable, so the refusal names them instead of failing open",
+    );
+  });
+});
+
+test("bridged freshness and index_health results feed the widget without moving attachment", async () => {
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+
+    await app.emit("tool_result", xdResult("freshness", {}, {
+      callId: "f1",
+      details: {
+        repository: { fullName: "Symvanta/omp-plugin" },
+        lastIndexedSha: "abcdef1234",
+        currentRemoteSha: "abcdef1234",
+        isStale: false,
+      },
+    }));
+    assert.equal(app.statusWrites().length, 1, "a bridged freshness result feeds the status bar");
+    assert.match(app.statusWrites()[0].text, /^symvanta: omp-plugin · fresh$/);
+
+    await app.emit("tool_result", xdResult("index_health", {}, {
+      callId: "h1",
+      details: { degradedRepositories: [{}], pendingLibraryVersions: [{}] },
+    }));
+    assert.equal(app.statusWrites().length, 2, "a bridged index_health result replaces the last observation");
+    assert.match(app.statusWrites()[1].text, /degraded/);
+
+    const [allowed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(allowed, undefined, "index observations never arm the guard");
+  });
+});
+
+test("a bridged relate or estimate_scope is the impact check, and in-flight or failed checks never open the gate", async () => {
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+    await app.emit("tool_result", xdResult("init", {}, { callId: "i1", details: { workspace: { attached: true } } }));
+
+    await app.emit("tool_call", xdWrite("relate", { kind: "blast_radius", symbol: "app" }, { callId: "c1" }));
+    const [inflight] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(inflight?.block, true, "a bridged check that has not returned must not wave the edit through");
+
+    await app.emit("tool_result", xdResult("relate", { kind: "blast_radius" }, { callId: "c1", isError: true, error: "server down" }));
+    const [failed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e2" });
+    assert.equal(failed?.block, true, "a failed bridged check leaves the gate shut, even in strict");
+
+    // This check arrives without its `tool_call` being seen, so the result's own
+    // logical invocation is what the fallback identity reads.
+    await app.emit("tool_result", xdResult("estimate_scope", { task: "x" }, {
+      callId: "c2",
+      blocks: [{ type: "text", text: "ok" }],
+    }));
+    const [opened] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e3" });
+    assert.equal(opened, undefined, "a successful bridged estimate_scope opens the gate");
+  });
+});
+
+test("foreign XD devices, unknown Symvanta tails, and malformed content are never unwrapped", async () => {
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+
+    const foreign = ["xd://mcp__github_init", "xd://lsp", "xd://mcp__symvanta_not_a_tool"];
+    for (const [index, path] of foreign.entries()) {
+      await app.emit("tool_result", xdResult("init", { repository: "x" }, {
+        callId: `x${index}`,
+        path,
+        details: { workspace: { repository: "Symvanta/omp-plugin", attached: true } },
+      }));
+    }
+    assert.deepEqual(app.statusWrites(), [], "a foreign device result is never a Symvanta result");
+    const [allowed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(allowed, undefined, "a foreign device never arms the guard");
+
+    await app.emit("tool_result", xdResult("init", {}, { callId: "m1", details: { workspace: { attached: true } } }));
+    const [armed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e2" });
+    assert.equal(armed?.block, true, "a well-formed bridged init still arms the guard");
+
+    // A device call whose content is not executable arguments is inert: it is
+    // not an observation (no status, no attachment) and not an impact check.
+    const observed = app.statusWrites().length;
+    await app.emit("tool_result", xdResult("init", {}, {
+      callId: "m2",
+      content: "{not json",
+      details: { workspace: { repository: "Symvanta/omp-plugin", attached: true } },
+    }));
+    assert.equal(app.statusWrites().length, observed, "malformed content never feeds the status bar");
+
+    await app.emit("tool_result", xdResult("relate", {}, { callId: "m3", content: "{not json" }));
+    const [stillBlocked] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e3" });
+    assert.equal(stillBlocked?.block, true, "malformed bridged content cannot satisfy the impact check");
+  });
+});
+
+test("ordinary writes stay gated, and direct MCP results still behave exactly as before", async () => {
+  await withSwitches({}, async () => {
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+    await app.emit("tool_result", xdResult("init", {}, { callId: "i1", details: { workspace: { attached: true } } }));
+
+    const [bridged] = await app.emit("tool_call", xdWrite("relate", { kind: "blast_radius" }, { callId: "c1" }));
+    assert.equal(bridged, undefined, "a bridged graph call is never gated as a mutation");
+
+    const [blockedWrite] = await app.emit("tool_call", {
+      toolName: "write",
+      input: { path: "src/app.ts", content: "export const app = 2;\n" },
+      toolCallId: "e1",
+    });
+    assert.equal(blockedWrite?.block, true, "an ordinary write to existing code is still gated");
+  });
+
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    const app = harness();
+    await app.start({ attached: null });
+
+    await app.emit("tool_result", symvantaResult("init", {
+      callId: "i1",
+      details: { workspace: { repository: "Symvanta/omp-plugin", attached: true } },
+    }));
+    assert.equal(app.statusWrites().length, 1, "a direct init result still feeds the status bar");
+
+    await app.emit("tool_call", { toolName: "mcp__symvanta_relate", input: { kind: "blast_radius" }, toolCallId: "c1" });
+    const [inflight] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(inflight?.block, true, "a direct in-flight check still does not open the gate");
+
+    await app.emit("tool_result", {
+      toolCallId: "c1",
+      toolName: "mcp__symvanta_relate",
+      input: { kind: "blast_radius" },
+      isError: false,
+      content: [{ type: "text", text: "ok" }],
+    });
+    const [allowed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e2" });
+    assert.equal(allowed, undefined, "a direct check still opens the gate");
+  });
+});
+
+test("strict XD ownership: only a Symvanta server token owns a device path", async () => {
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+
+    // A foreign server whose tool tail merely ends in a Symvanta token.
+    await app.emit("tool_result", xdResult("init", {}, {
+      callId: "f1",
+      path: "xd://mcp__github_symvanta_init",
+      details: { workspace: { repository: "Symvanta/omp-plugin", attached: true } },
+    }));
+    assert.deepEqual(app.statusWrites(), [], "a foreign server's device never feeds the status bar");
+    const [unarmed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(unarmed, undefined, "a foreign device never arms the guard");
+
+    // Arm through a Symvanta device, then show that the foreign device cannot
+    // satisfy the check it pretends to answer.
+    await app.emit("tool_result", xdResult("init", {}, { callId: "i1", details: { workspace: { attached: true } } }));
+    await app.emit("tool_call", xdWrite("relate", { kind: "blast_radius" }, { callId: "c1", path: "xd://mcp__github_symvanta_relate" }));
+    await app.emit("tool_result", xdResult("relate", { kind: "blast_radius" }, { callId: "c1", path: "xd://mcp__github_symvanta_relate" }));
+    const [stillBlocked] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e2" });
+    assert.equal(stillBlocked?.block, true, "a foreign device cannot satisfy the impact check");
+
+    await app.emit("tool_result", xdResult("relate", { kind: "blast_radius" }, { callId: "c2", path: "xd://mcp__symvanta_relate" }));
+    const [opened] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e3" });
+    assert.equal(opened, undefined, "the direct Symvanta device spelling opens the gate");
+  });
+
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+    await app.emit("tool_result", xdResult("init", {}, {
+      callId: "m1",
+      path: "xd://mcp__symvanta_symvanta_init",
+      details: { workspace: { attached: true } },
+    }));
+    const [blocked] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(blocked?.block, true, "the marketplace-doubled server spelling is Symvanta's own");
+  });
+});
+
+test("help-shaped bridged calls are inert: no status, no attachment, no pending check", async () => {
+  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict" }, async () => {
+    const app = harness({ tools: [] });
+    await app.start({ attached: null });
+
+    // Every help shape on a successful init: the outer write succeeded, and
+    // still nothing is observed and nothing is armed.
+    for (const [index, content] of ["", "?", "help"].entries()) {
+      await app.emit("tool_result", xdResult("init", {}, {
+        callId: `h${index}`,
+        content,
+        details: { workspace: { repository: "Symvanta/omp-plugin", attached: true } },
+      }));
+    }
+    // Missing content: the write carries no arguments at all.
+    await app.emit("tool_result", {
+      toolName: "write",
+      toolCallId: "h-missing",
+      input: { path: "xd://mcp__symvanta_init" },
+      details: { workspace: { repository: "Symvanta/omp-plugin", attached: true } },
+      isError: false,
+    });
+    // The device may also mark the result itself.
+    await app.emit("tool_result", xdResult("init", {}, {
+      callId: "h-marker",
+      details: { workspace: { repository: "Symvanta/omp-plugin", attached: true }, xdev: { mode: "help" } },
+    }));
+
+    assert.deepEqual(app.statusWrites(), [], "a help-mode init result never feeds the status bar");
+    const [unarmed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+    assert.equal(unarmed, undefined, "a help-mode init never arms the guard");
+
+    // Arm for real, then every help shape fails to satisfy the impact check.
+    await app.emit("tool_result", xdResult("init", {}, { callId: "i1", details: { workspace: { attached: true } } }));
+    const checks = [
+      { label: "empty content", input: { path: "xd://mcp__symvanta_relate", content: "" } },
+      { label: "question mark", input: { path: "xd://mcp__symvanta_relate", content: "?" } },
+      { label: "help word", input: { path: "xd://mcp__symvanta_relate", content: "help" } },
+      { label: "missing content", input: { path: "xd://mcp__symvanta_relate" } },
+      {
+        label: "result help marker",
+        input: { path: "xd://mcp__symvanta_relate", content: JSON.stringify({ kind: "blast_radius" }) },
+        details: { xdev: { mode: "help" } },
+      },
+    ];
+    for (const [index, check] of checks.entries()) {
+      await app.emit("tool_call", { toolName: "write", toolCallId: `c${index}`, input: check.input });
+      await app.emit("tool_result", {
+        toolName: "write",
+        toolCallId: `c${index}`,
+        input: check.input,
+        details: check.details,
+        isError: false,
+      });
+      const [blocked] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: `e${index + 2}` });
+      assert.equal(blocked?.block, true, `${check.label} must not satisfy the impact check`);
+    }
+
+    // An executable JSON object is still a real call.
+    await app.emit("tool_result", xdResult("estimate_scope", { task: "x" }, { callId: "ok" }));
+    const [opened] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e-open" });
+    assert.equal(opened, undefined, "an executable bridged call still opens the gate");
+  });
+});

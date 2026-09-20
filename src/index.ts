@@ -26,6 +26,12 @@
  *     same markdown templates the file commands use.
  *
  * Symvanta is reached exclusively through the MCP server declared in .mcp.json.
+ * A host that does not surface those tools directly delivers each call as
+ * `write` to an `xd://mcp__symvanta_<tool>` device path with the JSON arguments
+ * in `content`; one unwrapping seam (`logicalInvocation`) turns that into the
+ * same logical call a direct MCP invocation already is, and the impact guard,
+ * the status widget, and the attachment observation all read it.
+ *
  * This module never opens an HTTP connection of its own, never reads OMP's OAuth
  * or credential storage, and never uploads file contents: the only things it
  * reads are the origin remote URL, the bundled command templates, and the
@@ -96,6 +102,32 @@ const GUIDANCE_TYPE = "symvanta.guidance.";
 /** The read and grep tools whose calls the augmenters recognize. */
 const READ_TOOL = "read";
 const GREP_TOOL = "grep";
+
+/** The one host tool an XD device call arrives through: `write` to an `xd://` path. */
+const WRITE_TOOL = "write";
+
+/** An XD device path: the `xd://` scheme and the device or MCP tool it names. */
+const XD_DEVICE = /^xd:\/\//i;
+
+/**
+ * The device name of one of Symvanta's own MCP tools. Ownership is proven at
+ * the start, never by the tail: the wire name has to be the MCP form the host
+ * mints for the Symvanta server (`mcp__symvanta_relate`), its Claude-doubled
+ * separator spelling (`mcp__symvanta__relate`), or the marketplace-doubled
+ * `mcp__symvanta_symvanta_relate`, with a tail from the known-tool table. A
+ * device that merely ends in the same letters (`mcp__github_symvanta_relate`)
+ * or that prefixes the token (`mcp__notsymvanta_relate`) is not Symvanta's, so
+ * nothing it returns can move this session's status, attachment, or guard.
+ */
+const XD_SYMVANTA_DEVICE = /^mcp__symvanta(?:(?:__|_)symvanta)?(?:__|_)([a-z0-9_]+)$/i;
+
+/**
+ * The host's write-device sentinel for "show docs instead of executing". OMP's
+ * help predicate is the same shape with the same flags, and a content that
+ * matches it answers with a successful help result that never reached a tool,
+ * which is why such a call may not count as an executed Symvanta call.
+ */
+const DEVICE_HELP = /^\s*(\?|help)?\s*$/i;
 
 /** Widget lines shown below the editor. Three is the whole point: it sits under the prompt. */
 const STATUS_PLACEMENT = "belowEditor";
@@ -168,6 +200,18 @@ const PATH_FIELDS = ["path", "file_path", "filePath", "paths", "filePaths", "fil
 const MAX_TARGET_DEPTH = 4;
 
 type ToolAvailability = { relate: boolean; estimateScope: boolean };
+
+/**
+ * The logical Symvanta call a tool event carries: the bare tool name and the
+ * arguments it was given, whichever transport delivered it. `bridged` marks the
+ * XD device transport (`write` to an `xd://` path), the one transport where a
+ * successful `init` is also the only proof the MCP server is reachable at all.
+ * `executable` is whether the Symvanta tool actually ran: a device write that
+ * answered docs, or whose content was absent, malformed, or not a JSON object,
+ * completed without it and may not satisfy the guard, move the status, or arm
+ * anything. A direct MCP call always ran.
+ */
+type ToolInvocation = { tool: string; input: unknown; bridged: boolean; executable: boolean };
 
 /** The impact-guard strength this session runs at, parsed once from the environment. */
 type ImpactMode = "once" | "strict" | "warn" | "off";
@@ -321,6 +365,94 @@ function symvantaToolName(tool: unknown): string | null {
     return namespacedToolName(declared) ?? (declared || null);
   }
   return namespacedToolName(name);
+}
+
+/**
+ * The device URL a write call targets, or null when it targets none. OMP
+ * reaches a mounted XD device by calling `write` with an `xd://` URL where a
+ * file path would go, and only the write tool's own argument names are read:
+ * the first string field naming an `xd://` URL decides, so an ordinary file
+ * write is never mistaken for a device call whatever else it carries.
+ */
+function devicePath(input: unknown): string | null {
+  const record = eventRecord(input);
+  for (const field of PATH_FIELDS) {
+    const value = record[field];
+    const candidates = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") continue;
+      const target = candidate.trim();
+      if (XD_DEVICE.test(target)) return target;
+    }
+  }
+  return null;
+}
+
+/**
+ * The JSON arguments a device write carries, and whether the device executed
+ * them. OMP hands a device its arguments as `content`: an object is already
+ * parsed, and a string is the JSON encoding of one. The host reserves a content
+ * that is missing, empty, or the `?`/`help` sentinel for its docs answer, and
+ * it rejects malformed JSON and non-object values with an error, so none of
+ * those ever ran the tool: they carry no arguments and are marked
+ * non-executable, which keeps a docs answer from passing for a completed call.
+ */
+function deviceArguments(content: unknown): { input: Record<string, unknown>; executable: boolean } {
+  if (content !== null && typeof content === "object" && !Array.isArray(content)) {
+    return { input: content as Record<string, unknown>, executable: true };
+  }
+  if (typeof content === "string" && !DEVICE_HELP.test(content)) {
+    try {
+      const parsed: unknown = JSON.parse(content);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return { input: parsed as Record<string, unknown>, executable: true };
+      }
+    } catch {
+      // Malformed JSON names no arguments and ran no tool.
+    }
+  }
+  return { input: {}, executable: false };
+}
+
+/**
+ * Whether a write result says the device answered docs instead of executing.
+ * OMP attaches `{ xdev: { tool, mode, ... } }` to every device write's result
+ * details, and only `mode: "help"` never reached the tool. Absent or foreign
+ * metadata reads as an execution, because every other mode is one.
+ */
+function deviceAnsweredHelp(details: unknown): boolean {
+  const mode = eventRecord(eventRecord(details).xdev).mode;
+  return typeof mode === "string" && mode.trim().toLowerCase() === "help";
+}
+
+/**
+ * The logical Symvanta call a tool event carries, or null when the event is not
+ * one. Two transports land here and nowhere else: a direct MCP call
+ * (`mcp__symvanta_relate`, whose input is already the arguments) and an XD
+ * device call (`write` to `xd://mcp__symvanta_relate`, whose arguments travel
+ * as JSON in `content`). Both yield the same logical invocation, so the impact
+ * gate, the status widget, and the attachment observation read one shape
+ * instead of each knowing which transport carried the call.
+ *
+ * Everything else keeps its raw handling: an ordinary file write, an XD device
+ * of another kind, and a malformed device path are not Symvanta calls. The
+ * result-side `details` are read too, because the host's xdev metadata is the
+ * only way to tell a device call that ran from one that answered docs.
+ */
+function logicalInvocation(toolName: unknown, input: unknown, details?: unknown): ToolInvocation | null {
+  const name = typeof toolName === "string" ? toolName.trim().toLowerCase() : "";
+  if (name === WRITE_TOOL) {
+    const device = devicePath(input);
+    if (device === null) return null;
+    // The query and fragment of a device URL never name the tool, so they are
+    // dropped before the ownership read; the wire name is what remains.
+    const owned = XD_SYMVANTA_DEVICE.exec(device.replace(XD_DEVICE, "").replace(/[?#][\s\S]*$/, "").toLowerCase());
+    if (owned === null || !Object.hasOwn(SYMVANTA_TOOLS, owned[1])) return null;
+    const args = deviceArguments(eventRecord(input).content);
+    return { tool: owned[1], input: args.input, bridged: true, executable: args.executable && !deviceAnsweredHelp(details) };
+  }
+  const tool = symvantaToolName(toolName);
+  return tool === null ? null : { tool, input, bridged: false, executable: true };
 }
 
 /** Whether the connected Symvanta server exposes the impact tools the guard relies on. */
@@ -965,21 +1097,29 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
     // in "no opinion".
     try {
       const report = eventRecord(event);
-      const toolName = report.toolName;
-      const input = report.input;
       const state = stateFor(ctx as HandlerContext);
+      const invocation = logicalInvocation(report.toolName, report.input);
 
-      // The check itself: record that it is in flight and stay out of the way.
-      // It does not satisfy the guard yet. OMP fires `tool_call` for every call
-      // in a model batch before running any of them, so an edit scheduled beside
-      // this check reaches its own `tool_call` while the check has not run: only
-      // `tool_result` may open the gate.
-      if (isImpactCheckCall(toolName, input)) {
-        const callId = toolCallIdOf(event);
-        if (callId !== null) state.pendingImpact.add(callId);
+      // A Symvanta call never mutates a file, whichever transport carried it,
+      // and only the impact check is recorded: in flight, keyed by the outer
+      // tool call id, and nothing else. It does not satisfy the guard yet. OMP
+      // fires `tool_call` for every call in a model batch before running any of
+      // them, so an edit scheduled beside this check reaches its own `tool_call`
+      // while the check has not run: only `tool_result` may open the gate.
+      if (invocation !== null) {
+        // A device call that answered docs, or whose content was absent or
+        // malformed, never reached the tool, so it is not a check: the outer
+        // write's success says nothing about the graph. Only an executable
+        // impact check is recorded.
+        if (invocation.executable && isImpactCheckCall(invocation.tool, invocation.input)) {
+          const callId = toolCallIdOf(event);
+          if (callId !== null) state.pendingImpact.add(callId);
+        }
         return;
       }
 
+      const toolName = report.toolName;
+      const input = report.input;
       if (typeof toolName !== "string" || !Object.hasOwn(EDIT_TOOLS, toolName)) {
         // Everything that is not a mutation is a chance to route a search or a
         // read through the graph. Both are advice, and neither changes the call.
@@ -1046,12 +1186,19 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
       const handlerContext = ctx as HandlerContext;
       const state = stateFor(handlerContext);
       const callId = toolCallIdOf(event);
+      const invocation = logicalInvocation(record.toolName, record.input, record.details);
+      // Executable only: a docs answer and a malformed device payload both
+      // complete without the Symvanta tool running, and a result whose xdev
+      // metadata says `mode: "help"` did not run it either. None of them may
+      // satisfy the guard, move the status, or arm a tool, however successful
+      // the outer write looks.
+      const call = invocation !== null && invocation.executable ? invocation : null;
       // Matching the id pairs this result with the check this session issued.
       // The identity test is the fallback for a check whose `tool_call` this
       // module never saw (a call already in flight when the extension loaded).
       const pending = callId !== null && state.pendingImpact.delete(callId);
       const failed = record.isError === true || typeof record.error === "string";
-      if (!failed && (pending || isImpactCheckCall(record.toolName, record.input))) {
+      if (!failed && call !== null && (pending || isImpactCheckCall(call.tool, call.input))) {
         state.impactObserved = true;
       }
 
@@ -1060,10 +1207,21 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
       // changes nothing, so the last real observation stays on screen. An
       // `init` result also carries what it observed about attachment, which is
       // what opens the augmenters and the guard for this session.
-      const status = statusFromToolResult(symvantaToolName(record.toolName), record);
+      const status = statusFromToolResult(call === null ? null : call.tool, record);
       if (status !== null) {
         if (status.attached !== null) state.attached = status.attached;
         publishStatus(handlerContext, status);
+      }
+
+      // A successful bridged `init` proves the Symvanta server is answering in
+      // this session, and in a device-based harness that is the only proof
+      // there is: the MCP tools are reached through `write` to `xd://` paths
+      // and are not on `getAllTools()` at all, so without this the guard would
+      // find no impact tool to arm with. `relate` and `estimate_scope` are the
+      // pair the guard offers, so they are the pair marked available.
+      if (!failed && call !== null && call.bridged && call.tool === "init") {
+        state.tools = { relate: true, estimateScope: true };
+        state.hasImpactTool = true;
       }
 
       guideRescue(pi, state, record);

@@ -385,6 +385,57 @@ before editing, read the local file after the graph gives you the location, use
 results after a recent push, and fall back to local search only when the checkout
 is not attached. The `symvanta` skill holds the full tool decision matrix.
 
+### Direct MCP and the XD write-device bridge
+
+Symvanta tools can reach a session two ways, and the extension reads both
+through one unwrapping seam:
+
+- **Direct MCP tools**, whose wire names the host mints (`mcp__symvanta_relate`,
+  or the marketplace-shaped `mcp__symvanta_symvanta_relate`). The bare tool name
+  is resolved from the origin the host reports on the definition and, failing
+  that, from the wire name itself.
+- **XD write devices**, when the harness exposes the same tools as `write`
+  targets instead of mounted MCP tools: a `write` whose `path` is
+  `xd://mcp__symvanta_<tool>` carries the tool's JSON arguments as the write
+  content, and the seam turns that into the same logical invocation — the
+  `xd://` path names the tool, the content carries the arguments.
+
+Ownership is proven at the server segment, never by the tail: the device must be
+the MCP wire name the host mints for the Symvanta server itself
+(`xd://mcp__symvanta_<tool>`, its `xd://mcp__symvanta__<tool>` separator
+spelling, or the marketplace-doubled
+`xd://mcp__symvanta_symvanta_<tool>`), with a tail the Symvanta tool table
+knows. A device owned by another server is foreign even when its tail says
+otherwise — `xd://mcp__github_symvanta_relate` is not Symvanta's, because the
+server that owns it is not — and a device name that merely ends in the same
+letters or prefixes them (`xd://symvanta_relate`, `xd://mcp__notsymvanta_relate`)
+is not Symvanta's either. Every foreign device is left alone: `xd://lsp`,
+`xd://mcp__github_*`, or a `xd://mcp__symvanta_*` tail that is not a Symvanta
+tool stays an ordinary write.
+
+A device call can also be a schema lookup rather than a call: content that is
+empty, missing, `?`, or `help` asks the device to describe itself, and the device
+may say so on the result instead, as `details.xdev.mode: "help"`. A help-mode
+result is inert no matter how successful the outer `write` was — it never feeds
+the status bar, never records an attachment observation, never arms the guard,
+and never counts as an impact check. Malformed JSON content is inert the same
+way: it names no executable arguments, so it cannot satisfy a check. Only a
+`write` whose content is the tool's JSON arguments (or an already-parsed
+argument object) is a real call.
+
+This is why the status bar and the impact gate work in a harness that exposes
+the graph through write devices: a bridged `init` result feeds the widget and
+carries the same `workspace.attached` observation a direct one does, so it arms
+the gate and the augmenters; a bridged `freshness` or `index_health` result
+feeds the widget; and a bridged `relate` (kind: blast_radius) or
+`estimate_scope` counts as the impact check that opens the gate, tracked by the
+outer `write` call's tool-call id so a check that is still in flight or one that
+failed never waves an edit through. A successful bridged `init` is also what
+proves the tools are reachable when the harness mounts no MCP tool definitions,
+so the refusal names `relate` and `estimate_scope` instead of failing open.
+Nothing here adds a network call: the write device is OMP's own path to the MCP
+server, and the plugin still only reads the results the host hands it.
+
 ### Why the Claude Code hook family is not copied
 
 The Claude Code plugin ships per-tool "augmenter" hooks that read the stored

@@ -1119,3 +1119,121 @@ test("the runtime never speaks HTTP itself, never reads credentials, and reads o
     assert.doesNotMatch(module, /process\.env|node:|["'](?:fs|path|http|https)["']/, `${rel} must stay dependency-free`);
   }
 });
+
+// --------------------------------------------------------- XD write-device seam
+
+test("the runtime unwraps XD write devices, and the README documents the bridge", () => {
+  const extension = read(EXTENSION_FILE);
+  assert.ok(extension.includes("xd://"), `${EXTENSION_FILE} must recognize the xd:// device path`);
+  const broken = extension.replaceAll("xd://", "device://");
+  assert.notEqual(broken, extension, "the extension must name the xd:// scheme it unwraps");
+  expectCode(violationsFor({ [EXTENSION_FILE]: broken }), "runtime.contract");
+
+  const readme = read("README.md");
+  assert.ok(readme.includes("xd://mcp__symvanta_"), "README.md must document the XD write-device bridge");
+  assert.match(readme, /foreign device/i, "README.md must say which devices are never unwrapped");
+  const drifted = readme.replaceAll("xd://mcp__symvanta_", "xd://mcp__other_");
+  assert.notEqual(drifted, readme, "the README must name the device path it documents");
+  expectCode(violationsFor({ "README.md": drifted }), "readme.cli");
+});
+
+test("XD device ownership is read at the server segment, never the tail", () => {
+  const code = stripComments(read(EXTENSION_FILE));
+  const literal = extensionLiteral("XD_SYMVANTA_DEVICE");
+
+  const owned = [
+    "mcp__symvanta_relate",
+    "mcp__symvanta__relate",
+    "mcp__symvanta_symvanta_relate",
+    "mcp__symvanta_symvanta_estimate_scope",
+  ];
+  for (const wire of owned) {
+    const match = matcher(literal).exec(wire);
+    assert.ok(match, `${wire} must be read as Symvanta's own device`);
+    assert.ok(match[1].length > 0, `${wire} must name its tool tail`);
+  }
+
+  const foreign = [
+    "mcp__github_symvanta_relate",
+    "mcp__notsymvanta_relate",
+    "symvanta_relate",
+    "mcp__symvanta",
+    "xd://mcp__symvanta_relate",
+  ];
+  for (const wire of foreign) {
+    assert.equal(matcher(literal).exec(wire), null, `${wire} must not be read as Symvanta's device`);
+  }
+
+  const invocation = functionBody(code, "logicalInvocation");
+  assert.match(invocation, /XD_SYMVANTA_DEVICE/, "the ownership read must anchor the device name");
+  assert.match(invocation, /SYMVANTA_TOOLS/, "the tail only counts when the tool table names it");
+  assert.match(invocation, /deviceArguments/, "the arguments travel as the write content");
+  assert.match(invocation, /deviceAnsweredHelp/, "a docs answer must be marked non-executable");
+
+  for (const token of ["XD_SYMVANTA_DEVICE", "DEVICE_HELP", "deviceAnsweredHelp", "xdev"]) {
+    const broken = read(EXTENSION_FILE).replaceAll(token, "renamed");
+    assert.notEqual(broken, read(EXTENSION_FILE), `the extension must use ${token}`);
+    expectCode(violationsFor({ [EXTENSION_FILE]: broken }), "runtime.contract");
+  }
+});
+
+test("help-shaped device content is recognized and never executed", () => {
+  const code = stripComments(read(EXTENSION_FILE));
+  const help = extensionLiteral("DEVICE_HELP");
+
+  for (const content of ["", "   ", "?", "help", "HELP", " help "]) {
+    assert.ok(matcher(help).test(content), `${JSON.stringify(content)} must be the help sentinel`);
+  }
+  for (const content of ["{}", "{not json", "help me", "?x", "42"]) {
+    assert.ok(!matcher(help).test(content), `${JSON.stringify(content)} must not be the help sentinel`);
+  }
+
+  const argsStart = code.indexOf("function deviceArguments(");
+  assert.notEqual(argsStart, -1, `${EXTENSION_FILE} must define deviceArguments`);
+  const args = code.slice(argsStart, code.indexOf("\n}", argsStart));
+  assert.match(args, /DEVICE_HELP/, "the sentinel is what keeps a docs answer from executing");
+  assert.match(args, /executable/, "the arguments reader must report whether the tool ran");
+  assert.match(args, /JSON\.parse/, "a JSON string is the executable form of the arguments");
+
+  assert.match(
+    handlerBody(code, "tool_result"),
+    /executable/,
+    "a non-executable device call must not satisfy the guard, move the status, or arm a tool",
+  );
+  assert.match(
+    handlerBody(code, "tool_call"),
+    /executable/,
+    "a docs answer must not be recorded as a pending check",
+  );
+});
+
+test("the release reports 0.2.1 everywhere a marketplace upgrade reads it", () => {
+  assert.equal(PACKAGE_VERSION, "0.2.1", "the validator pins the release version");
+
+  const pkg = JSON.parse(read("package.json"));
+  const catalog = JSON.parse(read(CATALOG_FILE));
+  assert.equal(pkg.version, PACKAGE_VERSION, "the manifest carries the release version");
+  assert.equal(catalog.metadata.version, PACKAGE_VERSION, "the catalog metadata carries the release version");
+  assert.equal(catalog.plugins[0].version, PACKAGE_VERSION, "the catalog plugin entry carries the release version");
+
+  const [baseMajor, baseMinor, basePatch] = "0.2.0".split(".").map(Number);
+  const [major, minor, patch] = PACKAGE_VERSION.split(".").map(Number);
+  assert.ok(
+    major > baseMajor || (major === baseMajor && (minor > baseMinor || (minor === baseMinor && patch > basePatch))),
+    `a marketplace must read ${PACKAGE_VERSION} as newer than 0.2.0`,
+  );
+});
+
+// --------------------------------------------------- removed legacy switches
+
+test("the removed legacy impact switch is rejected wherever it reappears", () => {
+  const readme = `${read("README.md")}\nExport SYMVANTA_ENFORCE_IMPACT=off to disable the gate.\n`;
+  assert.notEqual(readme, read("README.md"), "the injection must name the removed switch");
+  expectOnly(violationsFor({ "README.md": readme }), "impact.legacy-switch");
+
+  const extension = `${read(EXTENSION_FILE)}\nconst legacy = process.env.SYMVANTA_ENFORCE_IMPACT;\n`;
+  expectOnly(violationsFor({ [EXTENSION_FILE]: extension }), "impact.legacy-switch");
+
+  const rule = `${read(RULE_FILE)}\nAn older profile may still set SYMVANTA_ENFORCE_IMPACT.\n`;
+  expectOnly(violationsFor({ [RULE_FILE]: rule }), "impact.legacy-switch");
+});

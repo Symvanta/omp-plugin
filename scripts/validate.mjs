@@ -16,9 +16,10 @@
 //   agent.*     agents/symvanta-*.md names, frontmatter, read-only tool set
 //   skill.*     skills/symvanta/SKILL.md presence and frontmatter
 //   runtime.*   the extension and its modules: session_start/session_switch context, pre-edit
-//               impact gate and its modes, command aliases, guidance-only augmenters,
-//               observation-only status widget, defensive tool-name resolution, no credential
-//               reads, no direct HTTP and no fetch
+//               impact gate and its modes, the XD write-device unwrapping seam, command
+//               aliases, guidance-only augmenters, observation-only status widget, defensive
+//               tool-name resolution, no credential reads, no direct HTTP and no fetch
+//   impact.*    no reference to the removed legacy impact switch anywhere in a shipped artifact
 //   readme.*    README documents both install lanes and their names, the impact modes, the
 //               agents, the augmenters, the observation-only widget, OAuth, reload, privacy,
 //               and the hook rationale
@@ -36,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PLUGIN_NAME = 'symvanta';
 export const PACKAGE_NAME = '@symvanta/omp-plugin';
-export const PACKAGE_VERSION = '0.2.0';
+export const PACKAGE_VERSION = '0.2.1';
 export const EXTENSION_ENTRIES = ['./src/index.ts'];
 export const REPOSITORY = 'Symvanta/omp-plugin';
 export const MCP_URL = '${SYMVANTA_MCP_URL:-https://mcp.symvanta.com/mcp}';
@@ -238,7 +239,20 @@ const EXPECTED_RUNTIME_PATTERNS = [
   ['pagination-aware rescue', /No more results/],
   ['guidance message namespace', /symvanta\.guidance\./],
   ['per-session augment dedupe', /\bdedup/i],
+  ['XD write-device unwrapping', /\bxd:\/\//],
+  ['XD device ownership', /\bXD_SYMVANTA_DEVICE\b/],
+  ['XD device help sentinel', /\bDEVICE_HELP\b/],
+  ['XD device result mode', /\bdeviceAnsweredHelp\b/],
+  ['XD device execution state', /\bexecutable\b/],
+  ['XD device logical invocation', /\blogicalInvocation\b/],
+  ['XD device result metadata', /\bxdev\b/],
 ];
+
+// The legacy impact switch (SYMVANTA_ENFORCE_IMPACT) was removed: an explicit
+// SYMVANTA_IMPACT_MODE is the only switch a session reads, and a fallback to the
+// removed name would silently change what the gate does. No shipped artifact may
+// name it again.
+const LEGACY_IMPACT_SWITCH = /\bSYMVANTA_ENFORCE_IMPACT\b/;
 
 // Code-side markers of the Claude Code hook shape: reading a credential file, or
 // opening the MCP endpoint directly. The OMP plugin must do neither. Comments are
@@ -301,6 +315,7 @@ const README_CLI_SNIPPETS = [
   ['rescue augment switch', 'SYMVANTA_AUGMENT_RESCUE'],
   ['dedupe augment switch', 'SYMVANTA_AUGMENT_DEDUPE'],
   ['attachment observation', 'workspace.attached'],
+  ['XD write-device bridge', 'xd://mcp__symvanta_'],
   ['literal command arguments', 'Arguments are inserted literally'],
   ['read selector shapes', ':50+150'],
   ['pagination-aware rescue', 'No more results'],
@@ -331,6 +346,9 @@ const README_REQUIREMENTS = [
   ['explorer agent', /symvanta-explorer/],
   ['tracer agent', /symvanta-tracer/],
   ['impact gate fails open', /fail(?:s)? open/i],
+  ['foreign-device rejection', /foreign device/i],
+  ['strict device ownership', /ownership is proven at the server segment/i],
+  ['help-mode inertness', /xdev\.mode/],
 ];
 
 // The commands table must list every shipped command, so a command cannot be
@@ -1074,6 +1092,28 @@ function checkRuntime(project, violations) {
   }
 }
 
+/**
+ * The legacy impact switch was removed, and it must not come back: a runtime
+ * that read it, or a README that documented it, would advertise a switch that
+ * does nothing. Scanned across every artifact a consumer loads or reads.
+ */
+function checkLegacyImpactSwitch(project, violations) {
+  const artifacts = [
+    ...RUNTIME_MODULES,
+    'README.md',
+    RULE_FILE,
+    SKILL_FILE,
+    ...markdownFiles(project, 'commands').map((name) => `commands/${name}`),
+    ...markdownFiles(project, 'agents').map((name) => `agents/${name}`),
+  ];
+  for (const rel of artifacts) {
+    const text = project.read(rel);
+    if (text !== undefined && LEGACY_IMPACT_SWITCH.test(text)) {
+      fail(violations, 'impact.legacy-switch', `${rel} names the removed legacy impact switch`);
+    }
+  }
+}
+
 // ----------------------------------------------------------------------- readme
 
 function checkReadme(project, violations) {
@@ -1154,6 +1194,7 @@ export function collectViolations(project) {
   checkAgents(project, violations);
   checkSkill(project, violations);
   checkRuntime(project, violations);
+  checkLegacyImpactSwitch(project, violations);
   checkReadme(project, violations);
   checkForeignArtifacts(project, violations);
   return violations;
