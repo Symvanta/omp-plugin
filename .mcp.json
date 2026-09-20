@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "symvanta": {
+      "type": "http",
+      "url": "${SYMVANTA_MCP_URL:-https://mcp.symvanta.com/mcp}",
+      "timeout": 120000
+    }
+  }
+}

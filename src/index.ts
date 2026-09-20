@@ -1,0 +1,679 @@
+/**
+ * Symvanta code-graph plugin for Oh My Pi (OMP).
+ *
+ * OMP extensions replace the Claude plugin's subprocess hooks. The Claude plugin
+ * shipped `hooks/*.js` programs that Claude Code spawned per event, with JSON on
+ * stdin and a JSON envelope on stdout. OMP loads a module like this one into the
+ * agent process instead, so the same behavior is expressed as extension
+ * handlers: the session primer is the `session_start` handler below, repeated
+ * when `/new` emits `session_switch` with reason `new`, and the PreToolUse
+ * Edit/Write augmenter is the `tool_call` impact guard (which can refuse a
+ * call, not only add context). There is no child process, no hook envelope,
+ * and no per-tool-call spawn cost.
+ *
+ * Symvanta is reached exclusively through the MCP server declared in .mcp.json.
+ * This module never opens an HTTP connection of its own, never reads OMP's OAuth
+ * or credential storage, and never uploads file contents: the only thing it
+ * reads from the checkout is the origin remote URL.
+ *
+ * Load-time rule: nothing acts during module load. Registration happens in the
+ * factory (`setLabel`, `on`), and every runtime action (`getAllTools`,
+ * `sendMessage`) runs from an event handler, after the runner is initialized.
+ */
+
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import * as path from "node:path";
+
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+
+import { buildStartupContext, parseGitHubRemote } from "./repository.js";
+
+/** Local git reads are fast; the bound only exists so a stuck git cannot stall a session. */
+const GIT_TIMEOUT_MS = 2000;
+const GIT_MAX_BUFFER = 64 * 1024;
+
+/** Tools that mutate an existing code file, including the edit tool's apply_patch wire name. */
+const EDIT_TOOLS: Record<string, true> = { edit: true, write: true, apply_patch: true };
+
+/** Extensions the graph indexes as code. Anything else passes the impact guard untouched. */
+const CODE_EXTENSIONS: Record<string, true> = {
+  ts: true, tsx: true, mts: true, cts: true, js: true, jsx: true, mjs: true, cjs: true,
+  py: true, go: true, rs: true, java: true, kt: true, kts: true, rb: true, php: true,
+  cs: true, swift: true, scala: true, c: true, h: true, cc: true, cpp: true, hpp: true,
+  m: true, mm: true, sh: true, bash: true, zsh: true, lua: true, dart: true, ex: true,
+  exs: true, erl: true, clj: true, cljs: true, hs: true, sql: true, vue: true,
+  svelte: true, astro: true,
+};
+
+/**
+ * The impact guard refuses at most this many mutations per session. It exists so
+ * a model that ignores the refusal (or a server-side check that never succeeds)
+ * cannot deadlock a session: after the first refusal the guard fails open.
+ */
+const MAX_GUARD_BLOCKS = 1;
+
+/** SYMVANTA_ENFORCE_IMPACT=off disables the guard; any other value (including unset) keeps it on. */
+const DISABLED_VALUES: Record<string, true> = { off: true, false: true, "0": true, no: true };
+
+/**
+ * The tools the Symvanta server exposes. A host mints MCP tools as
+ * `mcp__<server>_<tool>`, so a wire name has to be read back to its bare name
+ * before it can be compared against the impact pair; this table is what makes
+ * that read unambiguous when the tool name itself contains underscores
+ * (`estimate_scope`) and when the server token is repeated
+ * (`mcp__symvanta_symvanta_relate`).
+ */
+const SYMVANTA_TOOLS: Record<string, true> = {
+  add_repository: true, adr: true, ask_codebase: true, bundle: true, context: true,
+  create_project: true, diff_impact: true, estimate_scope: true, find_http_route: true,
+  find_node: true, freshness: true, history: true, index_health: true, init: true,
+  library: true, list_file_symbols: true, list_installations: true, list_projects: true,
+  list_repositories: true, list_tests_for: true, locate: true, map: true,
+  quick_lookup: true, ref: true, reindex_repository: true, relate: true, source: true,
+};
+
+/** A whole `symvanta` token and the separator run a host appends before the tool name. */
+const SYMVANTA_NAMESPACE = /(?<![A-Za-z0-9])symvanta(?:__|[_:-])+/gi;
+
+/** A hashline section header, `[path#TAG]`: the file that section edits. */
+const HASHLINE_HEADER = /^\s*\[([^\]\n]+?)#[^\]]*\]/gm;
+
+/** An apply_patch file marker: `*** Update File: path` and its Add/Delete siblings. */
+const APPLY_PATCH_HEADER = /^\s*\*\*\* (?:Update|Delete|Add) File:\s*(.+?)\s*$/gm;
+
+/**
+ * A sloppy-mode section header. `*** SM:EDIT path/to/file.ts` opens edits in a
+ * file, a bare `*** SM:EDIT` continues the file the current section already
+ * named, and `*** SM:EDIT all` only widens the match, so the first two name a
+ * file and the third names none. Case-insensitive, like the mode's own parser.
+ */
+const SLOPPY_HEADER = /^\s*\*{3}\s*SM:EDIT\b([^\n]*)$/gim;
+
+/**
+ * The XML-ish section a model sometimes writes instead of the header,
+ * `<SM:EDIT path="src/a.ts">`, with or without the `***` the real header needs.
+ */
+const SLOPPY_TAG_HEADER = /^\s*(?:\*{3}\s*)?<SM:EDIT\b([^>\n]*)>/gim;
+
+/** The `path` (or `file`) attribute of a sloppy tag: quoted with either quote, or bare. */
+const SLOPPY_TAG_PATH = /\b(?:path|file)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i;
+
+/** A path wrapper a model copied from tool output: `[path#TAG]`, or a bare `[path]`. */
+const COPIED_HEADER = /^\[([^\]#]+)(?:#[^\]]*)?\]$/;
+
+/** A path still wrapped in the quotes a model echoed around it. */
+const QUOTED_PATH = /^(["'])([\s\S]*)\1$/;
+
+/** A `file://` URL, the one scheme whose remainder is a plain path. */
+const FILE_URL = /^file:\/\//i;
+
+/** A URL with an authority (`https://`, `xd://`, `vault://`), which is never a filesystem path. */
+const URL_SCHEME = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//;
+
+/** A Windows drive (`C:\`, `C:/`): a path even though `C://` also parses as a scheme. */
+const WINDOWS_DRIVE = /^[A-Za-z]:[\\/]/;
+
+/** Unicode spaces OMP's PathPolicy folds to a plain space before resolving. */
+const UNICODE_SPACES = /[\u00a0\u2000-\u200a\u202f\u205f\u3000]/g;
+
+/** Argument names a host may use for the file a mutation targets. */
+const PATH_FIELDS = ["path", "file_path", "filePath", "paths", "filePaths", "files"] as const;
+
+/** Depth bound for a bridged input that wraps the real one, so a cycle cannot recurse forever. */
+const MAX_TARGET_DEPTH = 4;
+
+type ToolAvailability = { relate: boolean; estimateScope: boolean };
+
+type SessionState = {
+  /** A Symvanta impact check completed successfully in this session: the guard is satisfied. */
+  impactObserved: boolean;
+  /**
+   * Impact checks this session issued that have not resolved yet, keyed by tool
+   * call id. A call in flight is deliberately not satisfaction: OMP fires
+   * `tool_call` for a whole model batch before executing it, so crediting the
+   * check when it is merely issued would let an edit scheduled alongside it ride
+   * through on a check that may still fail.
+   */
+  pendingImpact: Set<string>;
+  /** Mutations this session already refused, capped by MAX_GUARD_BLOCKS. */
+  blocks: number;
+  /** Whether the Symvanta impact tools were present the last time they were probed. */
+  hasImpactTool: boolean;
+  /** Symvanta tools found on the last probe, so the refusal names only real options. */
+  tools: ToolAvailability;
+};
+
+type HandlerContext = {
+  cwd?: string;
+  hasUI?: boolean;
+  ui?: { notify: (message: string, level?: string) => void };
+  sessionManager?: { getSessionId?: () => string };
+};
+
+/** Sessions are separate: a process can host several, and each satisfies the guard on its own. */
+const sessions = new Map<string, SessionState>();
+
+function impactGuardDisabled(): boolean {
+  const value = process.env.SYMVANTA_ENFORCE_IMPACT;
+  return typeof value === "string" && Object.hasOwn(DISABLED_VALUES, value.trim().toLowerCase());
+}
+
+/** Session id when the runtime can supply one, else a shared bucket for the process. */
+function sessionKey(ctx: HandlerContext): string {
+  try {
+    const id = ctx.sessionManager?.getSessionId?.();
+    if (typeof id === "string" && id.length > 0) return id;
+  } catch {
+    // Fall through to the shared bucket.
+  }
+  return "default";
+}
+
+function stateFor(ctx: HandlerContext): SessionState {
+  const key = sessionKey(ctx);
+  let state = sessions.get(key);
+  if (!state) {
+    state = {
+      impactObserved: false,
+      pendingImpact: new Set<string>(),
+      blocks: 0,
+      hasImpactTool: false,
+      tools: { relate: false, estimateScope: false },
+    };
+    sessions.set(key, state);
+  }
+  return state;
+}
+
+/**
+ * Bare tool name when a wire name is shaped like one of Symvanta's, else null.
+ * Everything after the last whole `symvanta` token is the tool name, which is
+ * what lets every prefixing scheme resolve alike: `symvanta_relate`,
+ * `mcp__symvanta_relate`, `mcp__symvanta__relate`, and the marketplace-shaped
+ * `mcp__symvanta_symvanta_relate` all yield `relate`, and
+ * `mcp__symvanta_symvanta_estimate_scope` yields `estimate_scope` even though
+ * the tool name contains a separator of its own. The known-tool check is what
+ * keeps the read honest: a name that never says `symvanta` (`mcp__github_relate`)
+ * or whose tail is not a Symvanta tool (`mcp__symvanta_relate_extra`) is not
+ * Symvanta's, and the token has to be a whole one, so a server that merely ends
+ * in the same letters (`mcp__notsymvanta_relate`) is not either.
+ */
+function namespacedToolName(candidate: string): string | null {
+  const value = candidate.trim().toLowerCase();
+  let start = -1;
+  for (const match of value.matchAll(SYMVANTA_NAMESPACE)) start = (match.index ?? 0) + match[0].length;
+  if (start < 0) return null;
+
+  const bare = value.slice(start);
+  return Object.hasOwn(SYMVANTA_TOOLS, bare) ? bare : null;
+}
+
+/**
+ * Bare Symvanta tool name ("relate", "estimate_scope") for a tool definition or
+ * a tool-call name, or null when the tool is not Symvanta's. MCP tools carry
+ * their origin on the definition, which is checked first: a server named after
+ * Symvanta settles the question, in either the direct or the marketplace-doubled
+ * spelling, so its tool name is unwrapped when it carries a namespace and
+ * otherwise trusted as given, which keeps a renamed or newly added tool
+ * working. Without that, the name shape is the only evidence, and it has to
+ * look like a Symvanta wire name to count.
+ */
+function symvantaToolName(tool: unknown): string | null {
+  let name = "";
+  let server = "";
+  let mcpName = "";
+
+  if (typeof tool === "string") {
+    name = tool;
+  } else if (tool && typeof tool === "object") {
+    const record = tool as Record<string, unknown>;
+    if (typeof record.name === "string") name = record.name;
+    if (typeof record.mcpServerName === "string") server = record.mcpServerName;
+    if (typeof record.mcpToolName === "string") mcpName = record.mcpToolName;
+  }
+
+  if (server.trim().toLowerCase().includes("symvanta")) {
+    const declared = (mcpName || name).trim().toLowerCase();
+    return namespacedToolName(declared) ?? (declared || null);
+  }
+  return namespacedToolName(name);
+}
+
+/** Whether the connected Symvanta server exposes the impact tools the guard relies on. */
+function findSymvantaTools(pi: ExtensionAPI): ToolAvailability {
+  const found: ToolAvailability = { relate: false, estimateScope: false };
+  let tools: unknown;
+  try {
+    tools = pi.getAllTools();
+  } catch {
+    return found;
+  }
+  if (!Array.isArray(tools)) return found;
+
+  for (const tool of tools) {
+    const bare = symvantaToolName(tool);
+    if (bare === "relate") found.relate = true;
+    else if (bare === "estimate_scope") found.estimateScope = true;
+  }
+  return found;
+}
+
+/** A model call that performs the pre-edit impact check: estimate_scope, or relate(kind: blast_radius). */
+function isImpactCheckCall(toolName: unknown, input: unknown): boolean {
+  const name = typeof toolName === "string" ? toolName : "";
+  if (name.length === 0) return false;
+
+  const bare = symvantaToolName(name) ?? name.toLowerCase();
+  if (bare === "estimate_scope") return true;
+  if (bare !== "relate") return false;
+
+  const kind = input && typeof input === "object" ? (input as Record<string, unknown>).kind : undefined;
+  if (typeof kind !== "string") return false;
+  return kind.trim().toLowerCase().replace(/[\s_-]/g, "") === "blastradius";
+}
+
+/**
+ * The tool call id an event is about, or null when the host supplied none.
+ * `tool_call` and `tool_result` both carry it, which is what lets the guard pair
+ * a mutation with the check that actually ran before it instead of trusting that
+ * one was issued.
+ */
+function toolCallIdOf(event: unknown): string | null {
+  if (!event || typeof event !== "object") return null;
+  const value = (event as Record<string, unknown>).toolCallId;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * The path a sloppy section header names, or null when it names none: a bare
+ * `SM:EDIT` continues the current file, and `all` only widens the match. A
+ * trailing `all` flag is dropped from the path it qualifies, and a JSON-quoted
+ * path keeps its quotes for the shared unquoting step.
+ */
+function sloppyHeaderPath(rest: string): string | null {
+  let value = rest.trim();
+  if (value.length === 0 || /^all$/i.test(value)) return null;
+
+  const quoted = /^"(?:[^"\\]|\\.)*"/.exec(value);
+  if (quoted) {
+    const tail = value.slice(quoted[0].length).trim();
+    return tail.length === 0 || /^all$/i.test(tail) ? quoted[0] : null;
+  }
+
+  if (/\sall$/i.test(value)) value = value.slice(0, -3).trimEnd();
+  return value.length > 0 ? value : null;
+}
+
+/** The path a sloppy `<SM:EDIT ...>` tag names, or null when it carries no usable `path`/`file` attribute. */
+function sloppyTagPath(attributes: string): string | null {
+  const match = SLOPPY_TAG_PATH.exec(attributes);
+  if (!match) return null;
+
+  const value = (match[1] ?? match[2] ?? match[3] ?? "").trim();
+  return value.length > 0 ? value : null;
+}
+
+/** Paths a payload names through `header`, keeping only the matches `extract` reads as a file. */
+function headerPaths(payload: string, header: RegExp, extract: (tail: string) => string | null): string[] {
+  const targets: string[] = [];
+  for (const match of payload.matchAll(header)) {
+    const target = extract(match[1]);
+    if (target !== null) targets.push(target);
+  }
+  return targets;
+}
+
+/**
+ * Paths named by a patch payload: hashline `[path#TAG]` section headers, the
+ * apply_patch file markers (`*** Update File:`, `*** Delete File:`,
+ * `*** Add File:`), and both sloppy section spellings (`*** SM:EDIT path` and
+ * the XML-ish `<SM:EDIT path="...">`). Only a payload is scanned, never a
+ * `content` field: text being written is not a target, so a file that merely
+ * quotes a patch never matches. An `Add File:` target is no exception here, it
+ * is simply a path that usually does not exist yet and so passes the exists
+ * check below.
+ */
+function payloadTargets(payload: string): string[] {
+  return [
+    ...headerPaths(payload, HASHLINE_HEADER, (tail) => tail),
+    ...headerPaths(payload, APPLY_PATCH_HEADER, (tail) => tail),
+    ...headerPaths(payload, SLOPPY_HEADER, sloppyHeaderPath),
+    ...headerPaths(payload, SLOPPY_TAG_HEADER, sloppyTagPath),
+  ];
+}
+
+/**
+ * The local path a model-spelled target names, following OMP's PathPolicy: a
+ * leading `:` or `@` prefix, unicode spaces folded to a plain space, a `file://`
+ * URL decoded, the Windows verbatim prefix dropped, and `~`, `~/x`, `~\x`, or
+ * `~x` expanded with the OS home directory. A leading `@` or `:` is only an
+ * alias when what follows could be a path, so `@vault://x` keeps its `@` and is
+ * refused below rather than silently becoming one.
+ *
+ * Returns null when the value names no local file at all: a file URL with a
+ * broken escape, or any other scheme (`https://`, `xd://`, `vault://`), which
+ * OMP resolves through a handler of its own and never as a filesystem path.
+ * Resolving those against the cwd is exactly what would make the guard stat a
+ * file no mutation tool would touch.
+ */
+function normalizeAlias(candidate: string): string | null {
+  let value = candidate;
+
+  if (value.startsWith(":")) {
+    const rest = value.slice(1);
+    if (
+      rest.startsWith("/") ||
+      rest.startsWith("\\") ||
+      rest.startsWith("~") ||
+      rest.startsWith("./") ||
+      rest.startsWith("../") ||
+      WINDOWS_DRIVE.test(rest)
+    ) {
+      value = rest;
+    }
+  }
+  if (value.startsWith("@")) {
+    const rest = value.slice(1);
+    if (
+      rest.startsWith("/") ||
+      rest.startsWith("\\") ||
+      rest === "~" ||
+      rest.startsWith("~/") ||
+      rest.startsWith("local:") ||
+      WINDOWS_DRIVE.test(rest) ||
+      URL_SCHEME.test(rest)
+    ) {
+      value = rest;
+    }
+  }
+
+  value = value.replace(UNICODE_SPACES, " ");
+
+  if (FILE_URL.test(value)) {
+    // The percent-decoded remainder is the path; a broken escape names no file,
+    // so the target is dropped rather than guessed at.
+    try {
+      value = decodeURIComponent(value.slice(7));
+    } catch {
+      return null;
+    }
+  } else {
+    const scheme = URL_SCHEME.exec(value);
+    if (scheme !== null && !WINDOWS_DRIVE.test(value)) return null;
+  }
+
+  if (value.startsWith("\\\\?\\")) value = value.slice(4);
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\")) return path.join(homedir(), value.slice(2));
+  if (value.startsWith("~")) return path.join(homedir(), value.slice(1));
+  return value;
+}
+
+/**
+ * A target as the model spelled it. A copied `[path]` or `[path#TAG]` header and
+ * surrounding single or double quotes are stripped, so `src/a.ts`,
+ * `"src/a.ts"`, `[src/a.ts]`, and `[src/a.ts#1A2B]` all resolve to the same
+ * file. The wrappers nest (`"[src/a.ts#1A2B]"`), so they are applied until the
+ * value stops changing.
+ */
+function normalizeTarget(candidate: string): string {
+  let value = candidate.trim();
+  for (let pass = 0; pass < 3; pass += 1) {
+    const copied = COPIED_HEADER.exec(value);
+    const quoted = copied ? null : QUOTED_PATH.exec(value);
+    const next = (copied ? copied[1] : quoted ? quoted[2] : value).trim();
+    if (next === value) break;
+    value = next;
+  }
+  return value;
+}
+
+/**
+ * File paths a mutation call targets. OMP's edit modes cover three shapes: the
+ * `path` field (`replace`, `patch`), a hashline, apply_patch, or sloppy payload
+ * in `input`, and a payload handed over as the whole input. Arrays and a nested
+ * `input` object are descended into because a bridged call can arrive wrapped
+ * in either, and a string is read both ways: as the path it may be and as the
+ * payload it may name paths in. Every field contributes rather than the first
+ * non-empty one winning, so no shape can hide a target behind another.
+ */
+function editTargets(input: unknown, depth = 0): string[] {
+  if (depth > MAX_TARGET_DEPTH) return [];
+  if (typeof input === "string") return [input, ...payloadTargets(input)];
+  if (Array.isArray(input)) return input.flatMap((entry) => editTargets(entry, depth + 1));
+  if (!input || typeof input !== "object") return [];
+
+  const record = input as Record<string, unknown>;
+  const targets: string[] = [];
+  for (const field of PATH_FIELDS) {
+    const value = record[field];
+    if (typeof value === "string") targets.push(value);
+    else if (Array.isArray(value)) targets.push(...editTargets(value, depth + 1));
+  }
+
+  if (record.input !== undefined) targets.push(...editTargets(record.input, depth + 1));
+  return targets;
+}
+
+/**
+ * The first target of this mutation that already exists and is a code file, or
+ * null when the call creates new files, or touches only non-code files, both of
+ * which always pass.
+ */
+function gatedTarget(input: unknown, cwd: string): string | null {
+  for (const candidate of editTargets(input)) {
+    const cleaned = normalizeAlias(normalizeTarget(candidate));
+    if (cleaned === null || cleaned.length === 0) continue;
+
+    const absolute = path.resolve(cwd, cleaned);
+    if (!Object.hasOwn(CODE_EXTENSIONS, path.extname(absolute).slice(1).toLowerCase())) continue;
+
+    let present = false;
+    try {
+      present = existsSync(absolute);
+    } catch {
+      present = false;
+    }
+    if (present) return absolute;
+  }
+  return null;
+}
+
+function blockReason(relativePath: string, tools: ToolAvailability): string {
+  const options: string[] = [];
+  if (tools.estimateScope) options.push("estimate_scope for a task-level estimate");
+  if (tools.relate) options.push('relate with kind "blast_radius" for the symbol this change touches');
+  const check = options.length > 0 ? options.join(", or ") : "a Symvanta impact check";
+
+  return [
+    `Symvanta impact guard: ${relativePath} already exists and no Symvanta impact check has run in this session.`,
+    "OMP extensions replace the Claude plugin's PreToolUse subprocess hooks, so this check is enforced in process, before the mutation lands.",
+    `Run ${check}, then retry this call. As a user-invoked alternative, /symvanta-blast reports the same surface.`,
+    "New files and non-code files are never gated, this guard stops refusing after its first refusal, and SYMVANTA_ENFORCE_IMPACT=off turns it off.",
+  ].join("\n");
+}
+
+/**
+ * Read one git value, or null when git is missing, cwd is not a checkout, or the
+ * key has no value. execFile runs git directly: no shell is involved, so the
+ * argument list cannot be re-parsed or injected into, and the timeout plus
+ * SIGKILL mean a stuck git can never hold a session start open.
+ */
+function readGitValue(cwd: string, args: string[]): Promise<string | null> {
+  const { promise, resolve } = Promise.withResolvers<string | null>();
+  try {
+    execFile(
+      "git",
+      ["-C", cwd, ...args],
+      { timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: GIT_MAX_BUFFER, windowsHide: true },
+      (error, stdout) => {
+        resolve(error ? null : String(stdout ?? "").trim() || null);
+      },
+    );
+  } catch {
+    resolve(null);
+  }
+  return promise;
+}
+
+/** The checkout's shape, read locally: a GitHub slug when there is one, and whether this is a checkout at all. */
+async function readCheckout(cwd: string): Promise<{ slug: string | null; isCheckout: boolean }> {
+  const [root, origin] = await Promise.all([
+    readGitValue(cwd, ["rev-parse", "--show-toplevel"]),
+    readGitValue(cwd, ["config", "--get", "remote.origin.url"]),
+  ]);
+  return { slug: parseGitHubRemote(origin)?.slug ?? null, isCheckout: root !== null };
+}
+
+/** Starts a session's guard state over: unsatisfied, unblocked, tools re-probed. */
+function resetSessionState(pi: ExtensionAPI, ctx: HandlerContext): void {
+  const state = stateFor(ctx);
+  state.impactObserved = false;
+  state.pendingImpact.clear();
+  state.blocks = 0;
+  state.tools = findSymvantaTools(pi);
+  state.hasImpactTool = state.tools.relate || state.tools.estimateScope;
+}
+
+/**
+ * Queues the hidden repository primer for the next user prompt. It goes out
+ * even when git is unavailable, missing, or slow: the unbound branch of
+ * buildStartupContext is itself the right instruction, and a failed read must
+ * never delay or fail a session.
+ */
+async function queueRepositoryPrimer(pi: ExtensionAPI, cwd: string): Promise<void> {
+  let primer: string;
+  try {
+    primer = buildStartupContext(await readCheckout(cwd));
+  } catch {
+    primer = buildStartupContext({});
+  }
+
+  try {
+    // Hidden (display: false) and agent-attributed: this is context the plugin
+    // generated, not something the user typed. nextTurn queues it for the next
+    // user prompt without starting a turn of its own.
+    pi.sendMessage(
+      { customType: "symvanta.repository", content: primer, display: false, attribution: "agent" },
+      { deliverAs: "nextTurn", triggerTurn: false },
+    );
+  } catch (error) {
+    pi.logger?.warn?.(`symvanta: start context not queued: ${String(error)}`);
+  }
+}
+
+/** Fresh-session routine: guard state over, primer queued. Shared by `session_start` and `/new`. */
+async function initializeSession(pi: ExtensionAPI, ctx: HandlerContext): Promise<void> {
+  resetSessionState(pi, ctx);
+  await queueRepositoryPrimer(pi, ctx.cwd ?? process.cwd());
+}
+
+/** Whether a `session_switch` event started a new session (`/new`) rather than loading one. */
+function isNewSessionSwitch(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const reason = (event as Record<string, unknown>).reason;
+  return typeof reason === "string" && reason.trim().toLowerCase() === "new";
+}
+
+export default function symvantaPlugin(pi: ExtensionAPI) {
+  pi.setLabel("Symvanta");
+
+  pi.on("session_start", async (_event, ctx) => {
+    await initializeSession(pi, ctx as HandlerContext);
+  });
+
+  pi.on("session_switch", async (event, ctx) => {
+    // `/new` swaps in an empty transcript inside the same process and emits
+    // only this event, so without this branch a fresh session would get neither
+    // the primer nor a clean guard: the previous session's satisfaction would
+    // still stand. Resume, fork, and plain switches carry the transcript they
+    // loaded, so nothing is reissued for them.
+    if (!isNewSessionSwitch(event)) return;
+    await initializeSession(pi, ctx as HandlerContext);
+  });
+
+  pi.on("tool_call", (event, ctx) => {
+    // Fail open by construction: a throw from a tool_call handler blocks the
+    // tool, so every branch below is inside this try/catch and any surprise ends
+    // in "no opinion".
+    try {
+      const toolName = (event as { toolName?: unknown }).toolName;
+      const input = (event as { input?: unknown }).input;
+      const state = stateFor(ctx as HandlerContext);
+
+      // The check itself: record that it is in flight and stay out of the way.
+      // It does not satisfy the guard yet. OMP fires `tool_call` for every call
+      // in a model batch before running any of them, so an edit scheduled beside
+      // this check reaches its own `tool_call` while the check has not run: only
+      // `tool_result` may open the gate.
+      if (isImpactCheckCall(toolName, input)) {
+        const callId = toolCallIdOf(event);
+        if (callId !== null) state.pendingImpact.add(callId);
+        return;
+      }
+      if (typeof toolName !== "string" || !Object.hasOwn(EDIT_TOOLS, toolName)) return;
+      if (impactGuardDisabled() || state.impactObserved || state.blocks >= MAX_GUARD_BLOCKS) return;
+
+      // Availability is probed per session and re-probed lazily, so an MCP
+      // reload that connects Symvanta mid-session still arms the guard, and a
+      // session without Symvanta tools never blocks anything.
+      if (!state.hasImpactTool) {
+        state.tools = findSymvantaTools(pi);
+        state.hasImpactTool = state.tools.relate || state.tools.estimateScope;
+        if (!state.hasImpactTool) return;
+      }
+
+      const cwd = ctx.cwd ?? process.cwd();
+      const target = gatedTarget(input, cwd);
+      if (target === null) return;
+
+      state.blocks += 1;
+      const relative = path.relative(cwd, target) || target;
+      const reason = blockReason(relative, state.tools);
+      if (ctx.hasUI) {
+        try {
+          ctx.ui.notify(`Symvanta impact guard refused an edit to ${relative}: run an impact check first.`, "warning");
+        } catch {
+          // A notification is best effort; the refusal itself is what matters.
+        }
+      }
+      return { block: true, reason };
+    } catch {
+      return;
+    }
+  });
+
+  pi.on("tool_result", (event, ctx) => {
+    // Satisfaction is decided here and nowhere else: the gate opens only for an
+    // impact check that actually completed successfully, so a check that is
+    // still running, or one that failed, leaves it shut. Notification only
+    // otherwise: this never patches a result.
+    try {
+      const record = event as { toolName?: unknown; input?: unknown; isError?: unknown; error?: unknown };
+      const state = stateFor(ctx as HandlerContext);
+      const callId = toolCallIdOf(event);
+      // Matching the id pairs this result with the check this session issued.
+      // The identity test is the fallback for a check whose `tool_call` this
+      // module never saw (a call already in flight when the extension loaded).
+      const pending = callId !== null && state.pendingImpact.delete(callId);
+      const failed = record.isError === true || typeof record.error === "string";
+      if (!failed && (pending || isImpactCheckCall(record.toolName, record.input))) {
+        state.impactObserved = true;
+      }
+    } catch {
+      return;
+    }
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    try {
+      const key = sessionKey(ctx as HandlerContext);
+      sessions.get(key)?.pendingImpact.clear();
+      sessions.delete(key);
+    } catch {
+      // Nothing to clean up.
+    }
+  });
+}
