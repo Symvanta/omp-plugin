@@ -3,11 +3,12 @@
 // Two layers:
 //   1. the validator itself — the real tree passes, and each rule still fires
 //      when exactly one file is broken through withOverrides;
-//   2. the artifacts the validator cannot see — the shipped file set, the absent
-//      marketplace catalog, the direct Git install the README documents, and the
-//      extension's static contract (in-process events, toolCallId-keyed impact
-//      tracking, defensive tool-name resolution, apply_patch target parsing, the
-//      session-switch primer, no HTTP client and no credential reads).
+//   2. the artifacts the validator cannot see — the shipped file set, the
+//      marketplace catalog and the namespacing it triggers, both documented
+//      install lanes, the agents, and the extension's static contract
+//      (in-process events, impact modes, toolCallId-keyed impact tracking,
+//      defensive tool-name resolution, apply_patch target parsing, the
+//      session-switch primer, no HTTP client, no fetch, no credential reads).
 //
 // Node built-ins only, no network, no git: run with `node --test`.
 
@@ -17,14 +18,22 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  AGENTS,
   COMMANDS,
   EXTENSION_ENTRIES,
   INSTALL_COMMAND,
+  MARKETPLACE_ADD_COMMAND,
+  MARKETPLACE_ID,
+  MARKETPLACE_INSTALL_COMMAND,
+  MARKETPLACE_NAME,
+  MARKETPLACE_UNINSTALL_COMMAND,
   MCP_TIMEOUT_MS,
   MCP_URL,
   PACKAGE_NAME,
   PACKAGE_VERSION,
   PLUGIN_NAME,
+  SERVER_DIRECT,
+  SERVER_MARKETPLACE,
   UNINSTALL_COMMAND,
   collectViolations,
   projectFromDisk,
@@ -37,26 +46,43 @@ const SHIPPED = projectFromDisk(ROOT);
 
 const EXTENSION_FILE = "src/index.ts";
 const REPOSITORY_MODULE = "src/repository.js";
+const IMPACT_MODULE = "src/impact.js";
+const AUGMENT_MODULE = "src/augment.js";
+const STATUS_MODULE = "src/status.js";
+const COMMANDS_MODULE = "src/commands.js";
+const RUNTIME_MODULES = [EXTENSION_FILE, REPOSITORY_MODULE, IMPACT_MODULE, AUGMENT_MODULE, STATUS_MODULE, COMMANDS_MODULE];
+const PURE_MODULES = [REPOSITORY_MODULE, IMPACT_MODULE, AUGMENT_MODULE, STATUS_MODULE];
 const RULE_FILE = "rules/symvanta.md";
 const SKILL_FILE = "skills/symvanta/SKILL.md";
-const CATALOG_FILES = [".omp-plugin/marketplace.json", ".claude-plugin/marketplace.json", "marketplace.json"];
+const CATALOG_FILE = ".omp-plugin/marketplace.json";
+const STRAY_CATALOG_FILES = [".claude-plugin/marketplace.json", "marketplace.json"];
 const MARKETPLACE_DOC_HEADING = "## Marketplace namespacing";
 
 /** package.json files entries the release must ship, verbatim. */
-const PACKAGE_FILES = [".mcp.json", "LICENSE", "README.md", "commands", "rules", "scripts", "skills", "src"];
+const PACKAGE_FILES = [".mcp.json", ".omp-plugin", "LICENSE", "README.md", "agents", "commands", "rules", "scripts", "skills", "src"];
 
 /** Every artifact the plugin promises, whether or not package.json lists it. */
 const SHIPPED_ARTIFACTS = [
   EXTENSION_FILE,
   REPOSITORY_MODULE,
+  IMPACT_MODULE,
+  AUGMENT_MODULE,
+  STATUS_MODULE,
+  COMMANDS_MODULE,
   RULE_FILE,
   SKILL_FILE,
+  CATALOG_FILE,
   ".mcp.json",
   "README.md",
   "LICENSE",
   "scripts/validate.mjs",
+  "test/extension.test.mjs",
   ...COMMANDS.map((command) => `commands/${command}.md`),
+  ...AGENTS.map((agent) => `agents/${agent}.md`),
 ];
+
+/** Artifacts the published package must carry: everything a consumer needs, not the tests. */
+const PUBLISHED_ARTIFACTS = SHIPPED_ARTIFACTS.filter((rel) => !rel.startsWith("test/"));
 
 // ------------------------------------------------------------------- helpers
 
@@ -180,22 +206,11 @@ function extensionLiteral(name) {
   return regexLiteral(read(EXTENSION_FILE), name);
 }
 
-/** A catalog entry shaped like the one this release deleted, for the return-path tests. */
-function catalogFixture(source = { source: "github", repo: "Symvanta/omp-plugin" }) {
-  return JSON.stringify(
-    {
-      name: "symvanta-omp",
-      owner: { name: "Symvanta" },
-      plugins: [{ name: PLUGIN_NAME, description: "Symvanta plugin.", version: PACKAGE_VERSION, source }],
-    },
-    null,
-    2,
-  );
-}
-
-/** The README with the namespacing section a returning catalog must be documented by. */
-function readmeWithNamespaceDocs() {
-  return `${read("README.md")}\n${MARKETPLACE_DOC_HEADING}\n\nMarketplace installs are namespaced: OMP prefixes the command names and the MCP server name the plugin registers.\n`;
+/** The shipped catalog with one field broken, for the drift tests below. */
+function catalogFixture(overrides = {}) {
+  const catalog = JSON.parse(read(CATALOG_FILE));
+  const { entry = {}, ...top } = overrides;
+  return JSON.stringify({ ...catalog, ...top, plugins: [{ ...catalog.plugins[0], ...entry }] }, null, 2);
 }
 
 // ------------------------------------------------- the shipped tree is clean
@@ -223,7 +238,7 @@ test("package.json ships the extension, helper, docs, and validator", () => {
     );
   }
 
-  for (const artifact of SHIPPED_ARTIFACTS) {
+  for (const artifact of PUBLISHED_ARTIFACTS) {
     const covered = pkg.files.some((entry) => {
       const rel = entry.replace(/^\.\//, "").replace(/\/$/, "");
       return artifact === rel || artifact.startsWith(`${rel}/`);
@@ -232,10 +247,9 @@ test("package.json ships the extension, helper, docs, and validator", () => {
   }
 
   assert.deepEqual(pkg.omp?.extensions, EXTENSION_ENTRIES, "omp.extensions must point at the extension module");
-  assert.ok(
-    pkg.files.every((entry) => !entry.replace(/^\.\//, "").startsWith(".omp-plugin")),
-    "package.json must not publish a marketplace catalog directory",
-  );
+  assert.ok(pkg.files.includes(".omp-plugin"), "package.json must publish the marketplace catalog directory");
+  assert.ok(pkg.files.includes("agents"), "package.json must publish the task agents");
+  assert.ok(pkg.files.includes("scripts"), "package.json must publish the validator");
 });
 
 test("every promised artifact is present in the checkout", () => {
@@ -259,101 +273,116 @@ test("package.json scripts run the validator and the tests without an install st
 
 // ------------------------------------------------- marketplace catalog
 
-test("no marketplace catalog ships at any known path", () => {
-  for (const rel of CATALOG_FILES) {
-    assert.equal(SHIPPED.read(rel), undefined, `${rel} must not ship`);
+test("the marketplace catalog ships with this release's identity", () => {
+  const catalog = JSON.parse(read(CATALOG_FILE));
+
+  assert.equal(catalog.name, MARKETPLACE_NAME, "the catalog keeps the documented marketplace name");
+  assert.ok(catalog.owner?.name, "the catalog needs an owner");
+  assert.ok(Array.isArray(catalog.plugins) && catalog.plugins.length === 1, "the catalog lists the one plugin this release ships");
+
+  const entry = catalog.plugins[0];
+  assert.equal(entry.name, PLUGIN_NAME);
+  assert.equal(entry.version, PACKAGE_VERSION, "the catalog plugin version tracks the manifest");
+  assert.equal(catalog.metadata?.version, PACKAGE_VERSION, "the catalog metadata version tracks the manifest");
+  assert.equal(entry.source, "./", "the catalog ships inside the plugin it lists");
+  assert.equal(`${entry.name}@${catalog.name}`, MARKETPLACE_ID, "the plugin id is the documented one");
+
+  for (const rel of STRAY_CATALOG_FILES) {
+    assert.equal(SHIPPED.read(rel), undefined, `${rel} must not ship a second catalog`);
   }
-  assert.deepEqual(SHIPPED.list(".omp-plugin"), [], "the .omp-plugin directory must not ship");
-  assert.deepEqual(SHIPPED.list(".claude-plugin"), [], "the .claude-plugin directory must not ship");
-  assert.ok(
-    !read("package.json").includes(".omp-plugin"),
-    "package.json must not assume a marketplace catalog",
-  );
 });
 
-test("a returning marketplace catalog is rejected until the namespace rewriting is documented", () => {
-  for (const rel of CATALOG_FILES) {
-    const violations = violationsFor({ [rel]: catalogFixture() });
+test("catalog identity drift is rejected", () => {
+  expectOnly(violationsFor({ [CATALOG_FILE]: catalogFixture({ name: "other-market" }) }), "catalog.name");
+  expectOnly(violationsFor({ [CATALOG_FILE]: catalogFixture({ owner: {} }) }), "catalog.owner");
+  expectOnly(violationsFor({ [CATALOG_FILE]: catalogFixture({ entry: { version: "0.0.1" } }) }), "catalog.plugin-version");
+  expectOnly(violationsFor({ [CATALOG_FILE]: catalogFixture({ metadata: { version: "0.0.1" } }) }), "catalog.metadata-version");
+  expectMessage(
+    violationsFor({ [CATALOG_FILE]: catalogFixture({ entry: { name: "other-plugin" } }) }),
+    "catalog.plugin-missing",
+    PLUGIN_NAME,
+  );
+  expectCode(violationsFor({ [CATALOG_FILE]: catalogFixture({ entry: { description: "" } }) }), "catalog.plugin-description");
+});
 
-    expectMessage(violations, "catalog.namespace-docs", rel);
-    assert.deepEqual(
-      violations.filter((violation) => !violation.startsWith("catalog.namespace-docs")),
-      [],
-      `only the undocumented return of ${rel} may be wrong:${report(violations)}`,
+test("the catalog source must resolve to this repository root", () => {
+  const sources = [
+    "./src",
+    "src",
+    { source: "github", repo: "Other/plugin" },
+    { source: "url", url: "https://github.com/Other/plugin.git" },
+    { source: "npm", package: `${PACKAGE_NAME}` },
+  ];
+  for (const source of sources) {
+    expectCode(
+      violationsFor({ [CATALOG_FILE]: catalogFixture({ entry: { source } }) }),
+      "catalog.plugin-source",
     );
   }
 });
 
-test("namespacing prose outside the section does not license a catalog", () => {
-  const readme = `${read("README.md")}\nMarketplace installs are namespaced, so the command names and the MCP server name change.\n`;
-  for (const rel of CATALOG_FILES) {
-    expectCode(violationsFor({ "README.md": readme, [rel]: catalogFixture() }), "catalog.namespace-docs");
+test("a catalog at a second path is rejected", () => {
+  for (const rel of STRAY_CATALOG_FILES) {
+    const violations = violationsFor({ [rel]: read(CATALOG_FILE) });
+    expectMessage(violations, "catalog.path", rel);
   }
 });
 
-test("a documented catalog still has to resolve to this repository", () => {
-  const documented = violationsFor({ "README.md": readmeWithNamespaceDocs(), [CATALOG_FILES[0]]: catalogFixture() });
+test("the namespacing docs are required by the catalog", () => {
+  const withoutSection = read("README.md").replace(MARKETPLACE_DOC_HEADING, "## Name rewriting");
+  expectOnly(violationsFor({ "README.md": withoutSection }), "catalog.namespace-docs");
+
+  const proseOnly = `${withoutSection}\nMarketplace installs are namespaced: the command and MCP server names change, and aliases exist.\n`;
+  expectCode(violationsFor({ "README.md": proseOnly }), "catalog.namespace-docs");
+});
+
+test("the namespacing section must state the mechanism, both names, and the aliases", () => {
+  const readme = read("README.md");
+  const start = readme.indexOf(MARKETPLACE_DOC_HEADING);
+  assert.notEqual(start, -1, `README.md must carry a "${MARKETPLACE_DOC_HEADING}" section`);
+  const end = readme.indexOf("\n## ", start + 1);
+  const replaceSection = (body) => `${readme.slice(0, start)}${MARKETPLACE_DOC_HEADING}\n\n${body}\n${readme.slice(end)}`;
+
+  const full =
+    "Marketplace installs are namespaced: commands register as symvanta:symvanta-ask, the MCP server as symvanta:symvanta, and extension aliases keep the direct name `symvanta` and the stable /symvanta-* spelling working.";
   assert.deepEqual(
-    documented.filter((violation) => violation.startsWith("catalog.")),
+    violationsFor({ "README.md": replaceSection(full) }).filter((violation) => violation.startsWith("catalog.")),
     [],
-    `a documented catalog for this repository must pass the catalog checks:${report(documented)}`,
+    "a complete namespacing section must satisfy the docs check",
   );
 
-  for (const rel of CATALOG_FILES) {
-    const drifted = violationsFor({
-      "README.md": readmeWithNamespaceDocs(),
-      [rel]: catalogFixture({ source: "github", repo: "Other/plugin" }),
-    });
-    expectMessage(drifted, "catalog.plugin-source", rel);
+  const broken = [
+    ["namespacing mechanism", full.replace("namespaced", "renamed")],
+    ["namespaced command names", full.replace("symvanta:symvanta-ask", "the command")],
+    ["namespaced MCP server name", full.replace("symvanta:symvanta,", "the server,")],
+    ["direct MCP server name", full.replace("`symvanta`", "the direct name")],
+    ["stable command aliases", full.replace("aliases", "extensions")],
+  ];
+  for (const [label, body] of broken) {
+    expectMessage(violationsFor({ "README.md": replaceSection(body) }), "catalog.namespace-docs", label);
   }
-});
-
-test("marketplace install instructions are rejected wherever they appear", () => {
-  const readme = `${read("README.md")}\nInstall it with omp plugin install symvanta@symvanta-omp.\n`;
-  expectOnly(violationsFor({ "README.md": readme }), "readme.host-ism");
-
-  const command =
-    '---\ndescription: Route a lookup.\nargument-hint: "[symbol]"\n---\n\nRun /marketplace add Symvanta/omp-plugin, then look up $ARGUMENTS with relate.\n';
-  expectOnly(violationsFor({ "commands/symvanta-blast.md": command }), "command.host-ism");
-});
-
-test("a project-scoped install command is rejected: a Git install is user-wide", () => {
-  const readme = read("README.md");
-  const claimed = `${readme}\n${INSTALL_COMMAND} --scope project\n`;
-  assert.notEqual(claimed, readme, "the injection must add the project scope claim");
-  expectOnly(violationsFor({ "README.md": claimed }), "readme.host-ism");
-
-  const linked = `${readme}\nomp plugin link /path/to/omp-plugin --scope project\n`;
-  assert.notEqual(linked, readme, "the injection must add the link scope claim");
-  expectOnly(violationsFor({ "README.md": linked }), "readme.host-ism");
 });
 
 // ----------------------------------------------------------- install contract
 
-test("the documented install is the direct Git install, keeping the shipped names", () => {
+test("both install lanes are documented with their own names", () => {
   const readme = read("README.md");
 
   assert.ok(readme.includes(INSTALL_COMMAND), `README.md must document ${INSTALL_COMMAND}`);
   assert.ok(readme.includes(UNINSTALL_COMMAND), `README.md must document ${UNINSTALL_COMMAND}`);
-  assert.doesNotMatch(readme, /omp plugin marketplace\b/, "README.md must not document a catalog command");
-  assert.doesNotMatch(
-    readme,
-    /\bomp plugin (?:install|uninstall)\s+\S+@\S+/,
-    "README.md must not document a catalog-scoped plugin name",
-  );
+  assert.ok(readme.includes(MARKETPLACE_ADD_COMMAND), `README.md must document ${MARKETPLACE_ADD_COMMAND}`);
+  assert.ok(readme.includes(MARKETPLACE_INSTALL_COMMAND), `README.md must document ${MARKETPLACE_INSTALL_COMMAND}`);
+  assert.ok(readme.includes(MARKETPLACE_UNINSTALL_COMMAND), `README.md must document ${MARKETPLACE_UNINSTALL_COMMAND}`);
   assert.match(readme, /user-wide/, "a Git install is user-wide and the README must say so");
-  assert.doesNotMatch(
-    readme,
-    /\bomp plugin (?:install|link)\b[^\n]*--scope\s+project/,
-    "the installer honors --scope only for marketplace installs, so no project-scoped install may be documented",
-  );
+  assert.ok(readme.includes(SERVER_DIRECT), "the direct-lane MCP server name must be documented");
+  assert.ok(readme.includes(SERVER_MARKETPLACE), "the marketplace-lane MCP server name must be documented");
   for (const command of COMMANDS) {
     assert.ok(readme.includes(`/${command}`), `README.md must document /${command} as the name a consumer types`);
   }
-  assert.equal(JSON.parse(read(".mcp.json")).mcpServers[PLUGIN_NAME].url, MCP_URL, "the server stays `symvanta`");
+  assert.equal(JSON.parse(read(".mcp.json")).mcpServers[PLUGIN_NAME].url, MCP_URL, "the shipped server stays `symvanta`");
 });
 
-test("README drift for the documented install or uninstall is rejected", () => {
+test("README drift for a documented lane is rejected", () => {
   const readme = read("README.md");
 
   const noInstall = readme.replaceAll(INSTALL_COMMAND, "omp plugin add symvanta");
@@ -363,6 +392,36 @@ test("README drift for the documented install or uninstall is rejected", () => {
   const noUninstall = readme.replaceAll(UNINSTALL_COMMAND, "omp plugin remove symvanta");
   assert.notEqual(noUninstall, readme, "README.md must document the package-name uninstall");
   expectCode(violationsFor({ "README.md": noUninstall }), "readme.cli");
+
+  const noMarketplace = readme.replaceAll(MARKETPLACE_INSTALL_COMMAND, "omp plugin install symvanta");
+  assert.notEqual(noMarketplace, readme, "README.md must document the project-scoped marketplace install");
+  expectCode(violationsFor({ "README.md": noMarketplace }), "readme.cli");
+
+  const noCatalogAdd = readme.replaceAll(MARKETPLACE_ADD_COMMAND, "omp plugin add Symvanta/omp-plugin");
+  assert.notEqual(noCatalogAdd, readme, "README.md must document adding the marketplace");
+  expectCode(violationsFor({ "README.md": noCatalogAdd }), "readme.cli");
+});
+
+test("a foreign marketplace plugin id is rejected wherever it appears", () => {
+  const readme = `${read("README.md")}\nOr install it with omp plugin install other-plugin@other-market.\n`;
+  assert.ok(!readme.includes("other-plugin@other-market") === false, "the injection must name a foreign plugin id");
+  expectOnly(violationsFor({ "README.md": readme }), "readme.host-ism");
+
+  const command =
+    '---\ndescription: Route a lookup.\nargument-hint: "[symbol or path:symbol]"\n---\n\nInstall with omp plugin uninstall symvanta@other-market, then look up $ARGUMENTS with relate.\n';
+  expectOnly(violationsFor({ "commands/symvanta-blast.md": command }), "command.host-ism");
+});
+
+test("a scope claim on the direct lane is rejected: only marketplace installs take --scope", () => {
+  const readme = read("README.md");
+
+  const scopedInstall = `${readme}\n${INSTALL_COMMAND} --scope project\n`;
+  assert.notEqual(scopedInstall, readme, "the injection must add the project scope claim");
+  expectOnly(violationsFor({ "README.md": scopedInstall }), "readme.host-ism");
+
+  const linked = `${readme}\nomp plugin link /path/to/omp-plugin --scope project\n`;
+  assert.notEqual(linked, readme, "the injection must add the link scope claim");
+  expectOnly(violationsFor({ "README.md": linked }), "readme.host-ism");
 });
 
 // ------------------------------------------------------------------------ mcp
@@ -411,7 +470,7 @@ test("a command with two aggregate placeholders is rejected", () => {
 // ------------------------------------------------------- host-neutral markdown
 
 test("Claude-only tool prefixes in a command are rejected", () => {
-  const command = '---\ndescription: Route a lookup.\nargument-hint: "[symbol]"\n---\n\nLook up $ARGUMENTS with mcp__symvanta__relate.\n';
+  const command = '---\ndescription: Route a lookup.\nargument-hint: "[symbol or path:symbol]"\n---\n\nLook up $ARGUMENTS with mcp__symvanta__relate.\n';
   expectOnly(violationsFor({ "commands/symvanta-blast.md": command }), "command.host-ism");
 });
 
@@ -423,6 +482,48 @@ test("Claude plugin root variables in the skill are rejected", () => {
 test("Claude CLI syntax in the README is rejected", () => {
   const readme = `${read("README.md")}\nInstall it first with /plugin install symvanta.\n`;
   expectOnly(violationsFor({ "README.md": readme }), "readme.host-ism");
+});
+
+// ---------------------------------------------------------------------- agents
+
+test("both agents ship with read-only definitions", () => {
+  for (const agent of AGENTS) {
+    const text = read(`agents/${agent}.md`);
+    assert.match(text, new RegExp(`^name:\\s*${agent}$`, "m"), `agents/${agent}.md must declare its name`);
+    assert.match(text, /^description:\s*\S/m, `agents/${agent}.md must describe when to use it`);
+    assert.match(text, /read-only|never edit/i, `agents/${agent}.md must state that it never edits`);
+    assert.match(
+      text,
+      /\b(init|context|find_node|locate|relate|ask_codebase|map)\b/,
+      `agents/${agent}.md must route through the graph`,
+    );
+  }
+});
+
+test("an agent set drift is rejected", () => {
+  const explorer = read(`agents/${AGENTS[0]}.md`);
+  expectCode(violationsFor({ [`agents/${AGENTS[0]}.md`]: undefined }), "agent.set");
+  expectCode(violationsFor({ "agents/symvanta-stray.md": explorer }), "agent.set");
+  expectCode(violationsFor({ "agents/explorer.md": explorer }), "agent.name");
+});
+
+test("an agent that could edit, names a typo'd tool, or drops the read-only rule is rejected", () => {
+  const explorer = read(`agents/${AGENTS[0]}.md`);
+
+  const withEditingTool = explorer.replace(/^autoloadSkills:/m, "tools: read, edit\nautoloadSkills:");
+  expectOnly(violationsFor({ [`agents/${AGENTS[0]}.md`]: withEditingTool }), "agent.read-only");
+
+  const withTypo = explorer.replace(/^autoloadSkills:/m, "tools: read, relate_typo\nautoloadSkills:");
+  expectCode(violationsFor({ [`agents/${AGENTS[0]}.md`]: withTypo }), "agent.tools");
+
+  const noReadOnly = explorer.replace(/read-only|never edit/gi, "careful");
+  expectCode(violationsFor({ [`agents/${AGENTS[0]}.md`]: noReadOnly }), "agent.read-only");
+
+  const renamed = explorer.replace(/^name: .*$/m, "name: explorer");
+  expectCode(violationsFor({ [`agents/${AGENTS[0]}.md`]: renamed }), "agent.frontmatter");
+
+  const claude = `${explorer}\nUse mcp__symvanta__relate for the call graph.\n`;
+  expectOnly(violationsFor({ [`agents/${AGENTS[0]}.md`]: claude }), "agent.host-ism");
 });
 
 // ----------------------------------------------------------------------- rule
@@ -472,19 +573,71 @@ test("a policy that stops routing around local search is rejected", () => {
 
 test("an extension that drops an event registration is rejected", () => {
   const extension = read(EXTENSION_FILE);
-  for (const event of ["session_start", "session_switch", "tool_call"]) {
+  for (const event of ["session_start", "session_switch", "tool_call", "tool_result", "session_shutdown", "before_agent_start"]) {
     assert.ok(extension.includes(event), `the extension must register ${event}`);
     const broken = extension.replaceAll(event, event.replace("_", "-"));
     expectCode(violationsFor({ [EXTENSION_FILE]: broken }), "runtime.event");
   }
 });
 
-test("an extension that drops a runtime token is rejected", () => {
-  const extension = read(EXTENSION_FILE);
-  for (const token of ["blast_radius", "estimate_scope", "SYMVANTA_ENFORCE_IMPACT"]) {
-    assert.ok(extension.includes(token), `the extension must reference ${token}`);
-    const broken = extension.replaceAll(token, "impact");
-    expectCode(violationsFor({ [EXTENSION_FILE]: broken }), "runtime.token");
+test("a runtime that drops a capability token is rejected", () => {
+  const tokens = [
+    "blast_radius",
+    "estimate_scope",
+    "SYMVANTA_ENFORCE_IMPACT",
+    "SYMVANTA_IMPACT_MODE",
+    "SYMVANTA_AUGMENT",
+    "index_health",
+    "freshness",
+    "setWidget",
+    "setStatus",
+    "belowEditor",
+  ];
+
+  for (const token of tokens) {
+    const overrides = {};
+    for (const rel of RUNTIME_MODULES) {
+      const text = read(rel);
+      if (text.includes(token)) overrides[rel] = text.replaceAll(token, "renamed");
+    }
+    assert.ok(Object.keys(overrides).length > 0, `the runtime must reference ${token}`);
+    expectCode(violationsFor(overrides), "runtime.token");
+  }
+});
+
+test("a runtime that drops a capability or a command alias is rejected", () => {
+  const overridesForToken = (token) => {
+    const overrides = {};
+    for (const rel of RUNTIME_MODULES) {
+      const text = read(rel);
+      if (text.includes(token)) overrides[rel] = text.replaceAll(token, "renamed");
+    }
+    return overrides;
+  };
+
+  for (const [token, code] of [
+    ["parseImpactMode", "runtime.contract"],
+    ["IMPACT_MODES", "runtime.contract"],
+    ["augmentEnabled", "runtime.contract"],
+    ["statusFromToolResult", "runtime.contract"],
+    ["SYMVANTA_COMMANDS", "runtime.contract"],
+    ["registerCommand", "runtime.contract"],
+    ["renderCommandTemplate", "runtime.contract"],
+    ["symvanta.guidance.", "runtime.contract"],
+    ["state.attached", "runtime.contract"],
+    ["AGGREGATE_PLACEHOLDER", "runtime.contract"],
+    ["RANGE_CHUNK", "runtime.contract"],
+  ]) {
+    expectCode(violationsFor(overridesForToken(token)), code);
+  }
+
+  const commands = read(COMMANDS_MODULE);
+  for (const command of COMMANDS) {
+    assert.ok(commands.includes(command), `${COMMANDS_MODULE} must register ${command}`);
+    expectCode(
+      violationsFor({ [COMMANDS_MODULE]: commands.replaceAll(`"${command}"`, '"symvanta-does-not-exist"') }),
+      "runtime.command-alias",
+    );
   }
 });
 
@@ -512,16 +665,30 @@ test("a missing extension or helper file is rejected", () => {
   expectCode(violationsFor({ [REPOSITORY_MODULE]: undefined }), "runtime.missing");
 });
 
-test("a helper that stops being pure is rejected", () => {
+test("a pure helper that reaches outside itself is rejected", () => {
   const module = read(REPOSITORY_MODULE);
-  const impure = `import { readFileSync } from "node:fs";\n${module}\nconst token = process.env.SYMVANTA_MCP_TOKEN;\n`;
-  expectCode(violationsFor({ [REPOSITORY_MODULE]: impure }), "runtime.module-purity");
+
+  expectCode(
+    violationsFor({ [REPOSITORY_MODULE]: `import { readFileSync } from "node:fs";\n${module}` }),
+    "runtime.module-purity",
+  );
+  expectCode(violationsFor({ [REPOSITORY_MODULE]: `${module}\nconst token = process.env.SYMVANTA_MCP_TOKEN;\n` }), "runtime.module-purity");
+  expectCode(violationsFor({ [REPOSITORY_MODULE]: `${module}\nimport got from "got";\n` }), "runtime.module-purity");
+
+  // A sibling pure helper is not a dependency: the modules may share code as
+  // long as neither of them reaches for the environment or a package.
+  const shared = violationsFor({ [AUGMENT_MODULE]: `${read(AUGMENT_MODULE)}\nimport { isOffValue } from "./impact.js";\n` });
+  assert.ok(
+    !codesOf(shared).includes("runtime.module-purity"),
+    `a relative import between pure helpers must be allowed, got:${report(shared)}`,
+  );
 });
 
-test("a direct HTTP client or credential read in the extension is rejected", () => {
+test("a direct HTTP client, a fetch call, or a credential read in the runtime is rejected", () => {
   const extension = read(EXTENSION_FILE);
   const breakages = [
     ["direct HTTP client", `${extension}\nimport * as https from "node:https";\n`],
+    ["direct fetch call", `${extension}\nasync function leak() { await fetch("https://mcp.symvanta.com/mcp"); }\n`],
     ["credential file read", `${extension}\nconst raw = readFileSync(".credentials.json");\n`],
     ["OAuth credential-store access", `${extension}\nconst store = "mcp_oauth";\n`],
   ];
@@ -584,6 +751,48 @@ test("README still documents OAuth, reload, privacy, and the hook rationale", ()
   expectCode(violationsFor({ "README.md": noHooks }), "readme.cli");
 });
 
+test("README drift for a capability contract is rejected", () => {
+  const readme = read("README.md");
+  const cases = [
+    ["impact mode switch", "SYMVANTA_IMPACT_MODE", "readme.cli"],
+    ["legacy impact switch", "SYMVANTA_ENFORCE_IMPACT", "readme.cli"],
+    ["augment switch", "SYMVANTA_AUGMENT", "readme.cli"],
+    ["search augment switch", "SYMVANTA_AUGMENT_SEARCH", "readme.cli"],
+    ["dedupe augment switch", "SYMVANTA_AUGMENT_DEDUPE", "readme.cli"],
+    ["attachment observation", "workspace.attached", "readme.cli"],
+    ["literal command arguments", "Arguments are inserted literally", "readme.cli"],
+    ["read selector shapes", ":50+150", "readme.cli"],
+    ["pagination-aware rescue", "No more results", "readme.cli"],
+    ["unattached status", "not attached", "readme.requirement"],
+    ["observation-only widget", "observation-only", "readme.requirement"],
+    ["guidance-only augmenters", "guidance-only", "readme.requirement"],
+    ["prompt guidance determinism", "deterministic", "readme.requirement"],
+    ["explorer agent", "symvanta-explorer", "readme.requirement"],
+    ["tracer agent", "symvanta-tracer", "readme.requirement"],
+    ["strict impact mode", "`strict`", "readme.requirement"],
+  ];
+
+  for (const [label, token, code] of cases) {
+    const broken = readme.replaceAll(token, "renamed");
+    assert.notEqual(broken, readme, `README.md must document the ${label}`);
+    expectCode(violationsFor({ "README.md": broken }), code);
+  }
+});
+
+test("a command missing from the README table is rejected", () => {
+  const readme = read("README.md");
+  const row = readme.split("\n").find((line) => line.startsWith("| `/symvanta-recent"));
+  assert.ok(row, "README.md must list /symvanta-recent in the commands table");
+  expectCode(violationsFor({ "README.md": readme.replace(row, "") }), "readme.command-table");
+});
+
+test("a command whose declared hint drifts from the README row is rejected", () => {
+  const command = read("commands/symvanta-recent.md");
+  const drifted = command.replace('argument-hint: "[path (optional)]"', 'argument-hint: "[scope]"');
+  assert.notEqual(drifted, command, "the injection must change the declared hint");
+  expectOnly(violationsFor({ "commands/symvanta-recent.md": drifted }), "readme.command-hint");
+});
+
 test("the README does not claim the status command reports hidden gate state", () => {
   const readme = read("README.md");
   const row = readme.split("\n").find((line) => line.includes("/symvanta-status"));
@@ -625,7 +834,7 @@ test("no Claude Code hooks.json ships: OMP wires hooks as extension events", () 
 test("the extension registers in-process events instead of spawning hook processes", () => {
   const code = stripComments(read(EXTENSION_FILE));
 
-  for (const event of ["session_start", "session_switch", "tool_call", "tool_result", "session_shutdown"]) {
+  for (const event of ["session_start", "session_switch", "tool_call", "tool_result", "session_shutdown", "before_agent_start"]) {
     assert.match(code, new RegExp(`["'\`]${event}["'\`]`), `${EXTENSION_FILE} must register ${event}`);
   }
 
@@ -876,9 +1085,8 @@ test("path aliases and sloppy file attributes resolve to the local target", () =
   assert.equal(matcher(tagPath).exec("file=src/p.ts")[3], "src/p.ts", "a bare sloppy `file=` value must be read");
 });
 
-test("the extension never speaks HTTP itself and never reads credentials", () => {
-  const code = stripComments(read(EXTENSION_FILE));
-  const module = stripComments(read(REPOSITORY_MODULE));
+test("the runtime never speaks HTTP itself, never reads credentials, and reads only documented switches", () => {
+  const text = RUNTIME_MODULES.map((rel) => stripComments(read(rel))).join("\n");
 
   const forbidden = [
     ["direct HTTP client", /node:https?/],
@@ -890,13 +1098,27 @@ test("the extension never speaks HTTP itself and never reads credentials", () =>
   ];
 
   for (const [label, pattern] of forbidden) {
-    assert.doesNotMatch(code, pattern, `${EXTENSION_FILE} must not perform a ${label}`);
-    assert.doesNotMatch(module, pattern, `${REPOSITORY_MODULE} must not perform a ${label}`);
+    assert.doesNotMatch(text, pattern, `the runtime must not perform a ${label}`);
   }
 
-  for (const [, name] of code.matchAll(/process\.env\.([A-Za-z0-9_]+)/g)) {
-    assert.equal(name, "SYMVANTA_ENFORCE_IMPACT", `${EXTENSION_FILE} must not read credential-bearing env vars`);
+  // The only environment reads are the documented switches; a credential-bearing
+  // variable would have to be named here to pass.
+  const allowedEnv = new Set([
+    "SYMVANTA_ENFORCE_IMPACT",
+    "SYMVANTA_IMPACT_MODE",
+    "SYMVANTA_AUGMENT",
+    "SYMVANTA_AUGMENT_PROMPT",
+    "SYMVANTA_AUGMENT_SEARCH",
+    "SYMVANTA_AUGMENT_READ",
+    "SYMVANTA_AUGMENT_RESCUE",
+    "SYMVANTA_AUGMENT_DEDUPE",
+  ]);
+  for (const [, name] of text.matchAll(/process\.env\.([A-Za-z0-9_]+)/g)) {
+    assert.ok(allowedEnv.has(name), `the runtime must not read ${name}: only the documented switches may be read`);
   }
 
-  assert.doesNotMatch(module, /\bimport\b|\brequire\s*\(|process\.env|node:/, "the helper must stay dependency-free");
+  for (const rel of PURE_MODULES) {
+    const module = stripComments(read(rel));
+    assert.doesNotMatch(module, /process\.env|node:|["'](?:fs|path|http|https)["']/, `${rel} must stay dependency-free`);
+  }
 });

@@ -11,14 +11,30 @@
  * call, not only add context). There is no child process, no hook envelope,
  * and no per-tool-call spawn cost.
  *
+ * Four surfaces sit on top of that MCP server, and none of them talks to it:
+ *
+ *   - the impact guard, whose strength is SYMVANTA_IMPACT_MODE (once, strict,
+ *     warn, off) and whose refusal text is the only thing it says about a
+ *     mutation;
+ *   - the status widget, a view over `init`, `freshness`, and `index_health`
+ *     results the session already received;
+ *   - the guidance augmenters, which inject a hidden note about the graph call
+ *     that would answer the same question, and say in the note that they did not
+ *     query anything;
+ *   - the twelve `/symvanta-*` commands, registered by the extension so the
+ *     documented names survive marketplace namespace rewriting, rendering the
+ *     same markdown templates the file commands use.
+ *
  * Symvanta is reached exclusively through the MCP server declared in .mcp.json.
  * This module never opens an HTTP connection of its own, never reads OMP's OAuth
- * or credential storage, and never uploads file contents: the only thing it
- * reads from the checkout is the origin remote URL.
+ * or credential storage, and never uploads file contents: the only things it
+ * reads are the origin remote URL, the bundled command templates, and the
+ * results the host hands it.
  *
  * Load-time rule: nothing acts during module load. Registration happens in the
- * factory (`setLabel`, `on`), and every runtime action (`getAllTools`,
- * `sendMessage`) runs from an event handler, after the runner is initialized.
+ * factory (`setLabel`, `on`, `registerCommand`), and every runtime action
+ * (`getAllTools`, `sendMessage`, `sendUserMessage`, the UI setters) runs from an
+ * event handler or a command handler, after the runner is initialized.
  */
 
 import { execFile } from "node:child_process";
@@ -28,7 +44,21 @@ import * as path from "node:path";
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
+import {
+  augmentEnabled,
+  extractPromptTerms,
+  guideKey,
+  GUIDE_LIMITS,
+  promptGuidance,
+  readGuidance,
+  rescueGuidance,
+  searchGuidance,
+  searchTarget,
+} from "./augment.js";
+import { commandDirectory, loadCommandTemplate, renderCommandTemplate, SYMVANTA_COMMANDS } from "./commands.js";
+import { impactBlockLimit, impactBlocks, parseImpactMode, warnGuidance } from "./impact.js";
 import { buildStartupContext, parseGitHubRemote } from "./repository.js";
+import { statusFromToolResult } from "./status.js";
 
 /** Local git reads are fast; the bound only exists so a stuck git cannot stall a session. */
 const GIT_TIMEOUT_MS = 2000;
@@ -48,14 +78,27 @@ const CODE_EXTENSIONS: Record<string, true> = {
 };
 
 /**
- * The impact guard refuses at most this many mutations per session. It exists so
- * a model that ignores the refusal (or a server-side check that never succeeds)
- * cannot deadlock a session: after the first refusal the guard fails open.
+ * The impact guard refuses at most this many mutations per session in its
+ * default `once` mode. It exists so a model that ignores the refusal (or a
+ * server-side check that never succeeds) cannot deadlock a session: after the
+ * first refusal the guard fails open. `strict` raises the cap to infinity on
+ * purpose, because asking for it means asking not to fail open.
  */
 const MAX_GUARD_BLOCKS = 1;
 
-/** SYMVANTA_ENFORCE_IMPACT=off disables the guard; any other value (including unset) keeps it on. */
-const DISABLED_VALUES: Record<string, true> = { off: true, false: true, "0": true, no: true };
+/** The UI key the footer status and the below-editor widget are both published under. */
+const STATUS_KEY = "symvanta";
+
+/** Custom message types this extension injects. The primer keeps its original name. */
+const PRIMER_TYPE = "symvanta.repository";
+const GUIDANCE_TYPE = "symvanta.guidance.";
+
+/** The read and grep tools whose calls the augmenters recognize. */
+const READ_TOOL = "read";
+const GREP_TOOL = "grep";
+
+/** Widget lines shown below the editor. Three is the whole point: it sits under the prompt. */
+const STATUS_PLACEMENT = "belowEditor";
 
 /**
  * The tools the Symvanta server exposes. A host mints MCP tools as
@@ -126,6 +169,9 @@ const MAX_TARGET_DEPTH = 4;
 
 type ToolAvailability = { relate: boolean; estimateScope: boolean };
 
+/** The impact-guard strength this session runs at, parsed once from the environment. */
+type ImpactMode = "once" | "strict" | "warn" | "off";
+
 type SessionState = {
   /** A Symvanta impact check completed successfully in this session: the guard is satisfied. */
   impactObserved: boolean;
@@ -137,27 +183,58 @@ type SessionState = {
    * through on a check that may still fail.
    */
   pendingImpact: Set<string>;
-  /** Mutations this session already refused, capped by MAX_GUARD_BLOCKS. */
+  /** Mutations this session already refused, capped by MAX_GUARD_BLOCKS under `once`. */
   blocks: number;
   /** Whether the Symvanta impact tools were present the last time they were probed. */
   hasImpactTool: boolean;
   /** Symvanta tools found on the last probe, so the refusal names only real options. */
   tools: ToolAvailability;
+  /**
+   * SYMVANTA_IMPACT_MODE, resolved once per session so a mid-session environment
+   * change cannot make the guard behave differently between two edits.
+   */
+  impactMode: ImpactMode;
+  /**
+   * What a Symvanta `init` result observed about this checkout:
+   * `workspace.attached`. Null is "unknown", which is where every session
+   * starts: a direct Git install is user-wide, so this checkout may be one
+   * Symvanta has never seen, and nothing may advise or refuse until a result
+   * says otherwise. Only an observed boolean moves it.
+   */
+  attached: boolean | null;
+  /** Guidance this session already sent, so the same note is not repeated. */
+  guided: Set<string>;
+  /** Guidance sent per kind this session, bounded by GUIDE_LIMITS. */
+  guides: Record<string, number>;
+  /** Guidance sent across all kinds this session, bounded by GUIDE_LIMITS.total. */
+  guideTotal: number;
 };
 
 type HandlerContext = {
   cwd?: string;
   hasUI?: boolean;
-  ui?: { notify: (message: string, level?: string) => void };
+  ui?: {
+    notify: (message: string, level?: string) => void;
+    setStatus?: (key: string, text?: string) => void;
+    setWidget?: (key: string, content?: readonly string[], options?: { placement?: string }) => void;
+  };
   sessionManager?: { getSessionId?: () => string };
 };
 
 /** Sessions are separate: a process can host several, and each satisfies the guard on its own. */
 const sessions = new Map<string, SessionState>();
 
-function impactGuardDisabled(): boolean {
-  const value = process.env.SYMVANTA_ENFORCE_IMPACT;
-  return typeof value === "string" && Object.hasOwn(DISABLED_VALUES, value.trim().toLowerCase());
+/**
+ * A record view of an event payload. Handlers receive structurally typed
+ * events, but this module reads them through `unknown` on purpose: a host
+ * version that renames or drops a field must not crash a handler that only
+ * wanted to look at it. Narrowing once here keeps every read a checked property
+ * access on a named value, and an array or a primitive reads as an empty record
+ * rather than as a carrier of stray fields.
+ */
+function eventRecord(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
 }
 
 /** Session id when the runtime can supply one, else a shared bucket for the process. */
@@ -181,6 +258,11 @@ function stateFor(ctx: HandlerContext): SessionState {
       blocks: 0,
       hasImpactTool: false,
       tools: { relate: false, estimateScope: false },
+      impactMode: parseImpactMode(process.env),
+      attached: null,
+      guided: new Set<string>(),
+      guides: {},
+      guideTotal: 0,
     };
     sessions.set(key, state);
   }
@@ -458,6 +540,39 @@ function editTargets(input: unknown, depth = 0): string[] {
 }
 
 /**
+ * One line-range chunk of a read selector, without the colon: `50`, `L50`,
+ * `50-`, `5-16`, `L5-L16`, `5..16`, `5+150`, and `-60` (the last N lines) all
+ * name lines. The grammar is OMP's own (`splitPathAndSel` ->
+ * `parseLineRangeChunk`), where `..` is a forgiving alias for `-`, a bare
+ * trailing `-` or `..` is open-ended, and `+C` counts `C` lines from the start.
+ */
+const RANGE_CHUNK = String.raw`(?:L?\d+(?:-(?:L?\d*)|\.\.(?:L?\d*)|\+L?\d+)?|-\d+)`;
+
+/**
+ * A trailing read selector: a comma-joined range list, a mode word (`raw`,
+ * `img`, `conflicts`), or any ordering of the two (`:raw:5-16`, `:5-16:raw`).
+ * The prefix is matched lazily and the whole match is anchored, so the tail has
+ * to be *entirely* selectors: a Windows drive, an `archive.zip:member`, or a
+ * `src/a.ts:member` tail fails the match and stays part of the path, which is
+ * what the host's own parser does.
+ *
+ * The pattern alone cannot tell a selector from a filename, though: `:2024` is
+ * a valid `:N` in both, so a real file named `src/report:2024` looks exactly
+ * like a line read. That case is settled by literal-path precedence in
+ * `readTarget`, not here, because only the filesystem can answer it.
+ */
+const READ_SELECTOR = new RegExp(String.raw`^([\s\S]*?)(?::(?:${RANGE_CHUNK}(?:,${RANGE_CHUNK})*|raw|img|conflicts))+$`);
+
+/** `existsSync` with the failure contained: a path that cannot be stat'd is not there. */
+function existsQuietly(absolute: string): boolean {
+  try {
+    return existsSync(absolute);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The first target of this mutation that already exists and is a code file, or
  * null when the call creates new files, or touches only non-code files, both of
  * which always pass.
@@ -469,29 +584,59 @@ function gatedTarget(input: unknown, cwd: string): string | null {
 
     const absolute = path.resolve(cwd, cleaned);
     if (!Object.hasOwn(CODE_EXTENSIONS, path.extname(absolute).slice(1).toLowerCase())) continue;
-
-    let present = false;
-    try {
-      present = existsSync(absolute);
-    } catch {
-      present = false;
-    }
-    if (present) return absolute;
+    if (existsQuietly(absolute)) return absolute;
   }
   return null;
 }
 
-function blockReason(relativePath: string, tools: ToolAvailability): string {
+/**
+ * The code file a read call opens, or null when it opens none. Reading does not
+ * require the file to exist the way editing does, and a read may carry a line
+ * range or a mode (`src/a.ts:50-200`, `src/a.ts:raw:5..16`), which the path read
+ * drops before the extension check.
+ *
+ * A literal path wins over selector interpretation, exactly as the host decides
+ * it: a file that really is named `report:1` is read as that file, and only a
+ * path that is not there is read as its selector-stripped form. That is what
+ * keeps a colon in a filename from being mistaken for a line range.
+ */
+function readTarget(input: unknown, cwd: string): string | null {
+  for (const candidate of editTargets(input)) {
+    const cleaned = normalizeAlias(normalizeTarget(candidate));
+    if (cleaned === null || cleaned.length === 0) continue;
+
+    const absolute = path.resolve(cwd, cleaned);
+    const selector = READ_SELECTOR.exec(cleaned);
+    const stripped = selector === null ? absolute : path.resolve(cwd, selector[1]);
+    const candidates = selector === null || existsQuietly(absolute) ? [absolute, stripped] : [stripped, absolute];
+
+    for (const target of candidates) {
+      if (Object.hasOwn(CODE_EXTENSIONS, path.extname(target).slice(1).toLowerCase())) return target;
+    }
+  }
+  return null;
+}
+
+/**
+ * The refusal the guard returns, phrased for the mode that produced it: `once`
+ * stops after one, `strict` keeps refusing until a check completes, and the
+ * legacy SYMVANTA_ENFORCE_IMPACT=off alias maps to the off mode.
+ */
+function blockReason(relativePath: string, tools: ToolAvailability, mode: ImpactMode): string {
   const options: string[] = [];
   if (tools.estimateScope) options.push("estimate_scope for a task-level estimate");
   if (tools.relate) options.push('relate with kind "blast_radius" for the symbol this change touches');
   const check = options.length > 0 ? options.join(", or ") : "a Symvanta impact check";
 
+  const cap = mode === "strict"
+    ? "This session runs SYMVANTA_IMPACT_MODE=strict, so the guard keeps refusing until that check completes."
+    : "This guard stops refusing after its first refusal; SYMVANTA_IMPACT_MODE=strict keeps refusing instead, warn advises without blocking, and off disables the guard (the legacy SYMVANTA_ENFORCE_IMPACT=off maps to off).";
+
   return [
     `Symvanta impact guard: ${relativePath} already exists and no Symvanta impact check has run in this session.`,
     "OMP extensions replace the Claude plugin's PreToolUse subprocess hooks, so this check is enforced in process, before the mutation lands.",
     `Run ${check}, then retry this call. As a user-invoked alternative, /symvanta-blast reports the same surface.`,
-    "New files and non-code files are never gated, this guard stops refusing after its first refusal, and SYMVANTA_ENFORCE_IMPACT=off turns it off.",
+    `New files and non-code files are never gated. ${cap}`,
   ].join("\n");
 }
 
@@ -527,7 +672,7 @@ async function readCheckout(cwd: string): Promise<{ slug: string | null; isCheck
   return { slug: parseGitHubRemote(origin)?.slug ?? null, isCheckout: root !== null };
 }
 
-/** Starts a session's guard state over: unsatisfied, unblocked, tools re-probed. */
+/** Starts a session's guard state over: unsatisfied, unblocked, tools re-probed, mode re-read. */
 function resetSessionState(pi: ExtensionAPI, ctx: HandlerContext): void {
   const state = stateFor(ctx);
   state.impactObserved = false;
@@ -535,6 +680,185 @@ function resetSessionState(pi: ExtensionAPI, ctx: HandlerContext): void {
   state.blocks = 0;
   state.tools = findSymvantaTools(pi);
   state.hasImpactTool = state.tools.relate || state.tools.estimateScope;
+  state.impactMode = parseImpactMode(process.env);
+  state.attached = null;
+  state.guided.clear();
+  state.guides = {};
+  state.guideTotal = 0;
+}
+
+/**
+ * Reserve one guidance slot for this session: false when this note was already
+ * sent, or when the kind or the session has spent its budget. Reserving before
+ * delivery is what keeps a re-entrant preparation (OMP may run the whole
+ * `before_agent_start` chain again for one submission) from sending twice.
+ */
+function claimGuidance(state: SessionState, kind: string, key: string): boolean {
+  const dedupe = augmentEnabled(process.env, "dedupe");
+  if (dedupe && state.guided.has(key)) return false;
+  if ((state.guides[kind] ?? 0) >= (GUIDE_LIMITS[kind] ?? 0)) return false;
+  if (state.guideTotal >= GUIDE_LIMITS.total) return false;
+
+  if (dedupe) state.guided.add(key);
+  state.guides[kind] = (state.guides[kind] ?? 0) + 1;
+  state.guideTotal += 1;
+  return true;
+}
+
+/**
+ * Inject one hidden guidance note as an `aside`, which lands at the next agent
+ * step boundary and never interrupts the tool batch it describes. The note is
+ * agent-attributed and hidden because the plugin wrote it, not the user.
+ *
+ * Nothing here throws: a guidance note that cannot be delivered is not worth
+ * failing a tool call over, and the caller is inside a handler whose throw would
+ * be worse than a lost note.
+ */
+function sendGuidance(pi: ExtensionAPI, state: SessionState, kind: string, key: string, content: string): void {
+  try {
+    if (!claimGuidance(state, kind, key)) return;
+    pi.sendMessage(
+      { customType: `${GUIDANCE_TYPE}${kind}`, content, display: false, attribution: "agent" },
+      { deliverAs: "aside", triggerTurn: false },
+    );
+  } catch {
+    // A guidance note is best effort.
+  }
+}
+
+/**
+ * The routing note a local search earns. It recognizes the search the model is
+ * about to run and says which graph call answers the same question; it never
+ * refuses or rewrites the call, because a wrong guess about coverage must not
+ * cost the model its search.
+ */
+function guideSearch(pi: ExtensionAPI, state: SessionState, toolName: unknown, input: unknown): void {
+  if (!augmentEnabled(process.env, "search")) return;
+  // Silent until a Symvanta init result showed this checkout attached: a
+  // user-wide install must not send routing advice about an unindexed tree.
+  if (state.attached !== true) return;
+
+  const target = searchTarget(toolName, input);
+  if (target === null) return;
+  // The scope is part of the key: the same pattern searched in two trees is two
+  // searches, and the same scope with a new pattern is a new question.
+  const key = guideKey("search", `${target.tool}:${target.scope ?? "-"}:${target.query}`);
+  sendGuidance(pi, state, "search", key, searchGuidance(target));
+}
+
+/** The routing note the first read of a code file earns: list_file_symbols, and adr with it. */
+function guideRead(pi: ExtensionAPI, state: SessionState, toolName: unknown, input: unknown, cwd: string): void {
+  if (!augmentEnabled(process.env, "read")) return;
+  if (state.attached !== true) return;
+  if (typeof toolName !== "string" || toolName.trim().toLowerCase() !== READ_TOOL) return;
+
+  const target = readTarget(input, cwd);
+  if (target === null) return;
+  sendGuidance(pi, state, "read", guideKey("read", target), readGuidance(path.relative(cwd, target) || target));
+}
+
+/**
+ * The rescue note an empty, successful grep earns. `grep` reports an empty page
+ * as `matchCount: 0` in its details and as `No matches found` in its text, so
+ * both are read; a `No more results` page is a page past the end of a search
+ * that did match, and is deliberately not treated as empty.
+ */
+function guideRescue(pi: ExtensionAPI, state: SessionState, event: Record<string, unknown>): void {
+  if (!augmentEnabled(process.env, "rescue")) return;
+  if (state.attached !== true) return;
+  if (typeof event.toolName !== "string" || event.toolName.trim().toLowerCase() !== GREP_TOOL) return;
+  if (event.isError === true || typeof event.error === "string") return;
+
+  const details = eventRecord(event.details);
+  const blocks = Array.isArray(event.content) ? event.content : [];
+  const body = blocks
+    .map((block) => String(eventRecord(block).text ?? ""))
+    .join("\n");
+
+  // A page past the end of a search that did match reports `matchCount: 0` for
+  // the page it returned, so the pagination notice is checked first and wins
+  // over the count: that search found something, it is just on an earlier page.
+  if (/^\s*No more results\b/.test(body)) return;
+  if (details.matchCount !== 0 && !/^\s*No matches found\b/.test(body)) return;
+
+  const input = eventRecord(event.input);
+  const pattern = typeof input.pattern === "string" ? input.pattern : "";
+  sendGuidance(pi, state, "rescue", guideKey("rescue", pattern), rescueGuidance(pattern));
+}
+
+/**
+ * Publish the status one Symvanta result justified: the footer status, plus the
+ * compact widget under the editor. Both carry the same key, so a later result
+ * replaces the earlier one instead of stacking. In a headless or stubbed mode
+ * the setters are absent or inert, which is why every call is optional and
+ * wrapped: a missing status line is never worth failing a tool result over.
+ */
+function publishStatus(ctx: HandlerContext, status: { text: string | null; lines: string[] }): void {
+  const ui = ctx.ui;
+  if (!ui) return;
+  try {
+    if (status.text !== null && typeof ui.setStatus === "function") ui.setStatus(STATUS_KEY, status.text);
+    if (status.lines.length > 0 && typeof ui.setWidget === "function") {
+      ui.setWidget(STATUS_KEY, status.lines, { placement: STATUS_PLACEMENT });
+    }
+  } catch {
+    // The status line is observation only.
+  }
+}
+
+/** Drop this plugin's status and widget, so a new session never shows the last one's index. */
+function clearStatus(ctx: HandlerContext): void {
+  const ui = ctx.ui;
+  if (!ui) return;
+  try {
+    if (typeof ui.setStatus === "function") ui.setStatus(STATUS_KEY, undefined);
+    if (typeof ui.setWidget === "function") ui.setWidget(STATUS_KEY, undefined);
+  } catch {
+    // Nothing to clear.
+  }
+}
+
+/**
+ * Register the twelve documented `/symvanta-*` commands.
+ *
+ * A markdown file under `commands/` is a plugin file command, and a marketplace
+ * install hands those to OMP's namespace rewriting, so the documented
+ * `/symvanta-blast` would only be reachable as `/symvanta:symvanta-blast`. An
+ * extension-registered command keeps the name it was registered with in every
+ * install shape, so these twelve are registered here and render the same
+ * templates, which keeps one source of instruction text and two names for it.
+ *
+ * The template is read lazily, on the first invocation, from the plugin's own
+ * `commands/` directory, and the built-in body stands in when it cannot be
+ * read. Registration at load touches no disk and cannot fail the session: a
+ * command that could not register is logged and skipped.
+ */
+function registerCommands(pi: ExtensionAPI): void {
+  const directory = commandDirectory(import.meta.url);
+  for (const [name, command] of Object.entries(SYMVANTA_COMMANDS)) {
+    try {
+      pi.registerCommand(name, {
+        description: command.description,
+        async handler(args: string, ctx: unknown) {
+          try {
+            const text = renderCommandTemplate(loadCommandTemplate(name, directory), args);
+            // User-attributed: the command's own text is what the user asked
+            // for, and the transcript should read as if they typed it.
+            await pi.sendUserMessage(text, { attribution: "user" });
+          } catch (error) {
+            pi.logger?.warn?.(`symvanta: ${name} did not dispatch: ${String(error)}`);
+            try {
+              (ctx as HandlerContext | undefined)?.ui?.notify?.(`Symvanta ${name} could not be sent.`, "warning");
+            } catch {
+              // The notification is best effort.
+            }
+          }
+        },
+      });
+    } catch (error) {
+      pi.logger?.warn?.(`symvanta: ${name} not registered: ${String(error)}`);
+    }
+  }
 }
 
 /**
@@ -564,8 +888,18 @@ async function queueRepositoryPrimer(pi: ExtensionAPI, cwd: string): Promise<voi
   }
 }
 
-/** Fresh-session routine: guard state over, primer queued. Shared by `session_start` and `/new`. */
+/**
+ * Fresh-session routine: last session's status dropped, guard state over,
+ * primer queued. Shared by `session_start` and `/new`.
+ *
+ * The status is cleared unconditionally, before anything else. `/new` can hand
+ * this transcript a new session id, so a "was published" flag kept under the old
+ * id says nothing about what the UI is still showing: the widget from the
+ * previous session would stay on screen. Clearing is two no-op-safe calls, so
+ * the cheap unconditional path is also the correct one.
+ */
 async function initializeSession(pi: ExtensionAPI, ctx: HandlerContext): Promise<void> {
+  clearStatus(ctx);
   resetSessionState(pi, ctx);
   await queueRepositoryPrimer(pi, ctx.cwd ?? process.cwd());
 }
@@ -579,6 +913,11 @@ function isNewSessionSwitch(event: unknown): boolean {
 
 export default function symvantaPlugin(pi: ExtensionAPI) {
   pi.setLabel("Symvanta");
+
+  // Registered at load, from the bundled templates: this is the one place the
+  // documented `/symvanta-*` names are guaranteed to survive, because a
+  // marketplace install rewrites the names of file commands but not these.
+  registerCommands(pi);
 
   pi.on("session_start", async (_event, ctx) => {
     await initializeSession(pi, ctx as HandlerContext);
@@ -594,13 +933,41 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
     await initializeSession(pi, ctx as HandlerContext);
   });
 
+  pi.on("before_agent_start", (event, ctx) => {
+    // Guidance only, and additive: the prompt is not rewritten, the tools are
+    // not narrowed, and the note goes back as a hidden companion message that
+    // never reaches the transcript. The delivery is the returned message, not a
+    // queued aside, because this hook is the one place the note belongs to the
+    // submission it was read from.
+    //
+    // Deterministic on purpose, with no dedupe and no budget: OMP can run this
+    // hook again for the same submission after a source-base change and keeps
+    // only the accepted attempt's message, so a note claimed by a discarded
+    // attempt would be lost. Firing once per prompt, and once per queued batch
+    // of user work, is the bound instead.
+    try {
+      if (!augmentEnabled(process.env, "prompt")) return;
+      const state = stateFor(ctx as HandlerContext);
+      // Silent until an init result has shown this checkout attached.
+      if (state.attached !== true) return;
+      const terms = extractPromptTerms(eventRecord(event).prompt);
+      if (terms.length === 0) return;
+
+      const content = promptGuidance(terms);
+      return { message: { customType: `${GUIDANCE_TYPE}prompt`, content, display: false, attribution: "agent" } };
+    } catch {
+      return;
+    }
+  });
+
   pi.on("tool_call", (event, ctx) => {
     // Fail open by construction: a throw from a tool_call handler blocks the
     // tool, so every branch below is inside this try/catch and any surprise ends
     // in "no opinion".
     try {
-      const toolName = (event as { toolName?: unknown }).toolName;
-      const input = (event as { input?: unknown }).input;
+      const report = eventRecord(event);
+      const toolName = report.toolName;
+      const input = report.input;
       const state = stateFor(ctx as HandlerContext);
 
       // The check itself: record that it is in flight and stay out of the way.
@@ -613,8 +980,24 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
         if (callId !== null) state.pendingImpact.add(callId);
         return;
       }
-      if (typeof toolName !== "string" || !Object.hasOwn(EDIT_TOOLS, toolName)) return;
-      if (impactGuardDisabled() || state.impactObserved || state.blocks >= MAX_GUARD_BLOCKS) return;
+
+      if (typeof toolName !== "string" || !Object.hasOwn(EDIT_TOOLS, toolName)) {
+        // Everything that is not a mutation is a chance to route a search or a
+        // read through the graph. Both are advice, and neither changes the call.
+        guideSearch(pi, state, toolName, input);
+        guideRead(pi, state, toolName, input, ctx.cwd ?? process.cwd());
+        return;
+      }
+      if (state.impactMode === "off") return;
+      // Silent until a Symvanta init result has shown this checkout attached,
+      // which is what "unattached" means for a user-wide install. An impact
+      // check that already succeeded is the exception: the model asked for it
+      // explicitly, so the gate is open whatever the status widget believes.
+      if (state.attached !== true && !state.impactObserved) return;
+      // The gate: satisfied, or already refused as often as this mode allows.
+      // `once` stops at MAX_GUARD_BLOCKS and fails open; `strict` never does.
+      // `warn` refuses nothing, so it never stops here and advises below.
+      if (state.impactObserved || (impactBlocks(state.impactMode) && state.blocks >= impactBlockLimit(state.impactMode, MAX_GUARD_BLOCKS))) return;
 
       // Availability is probed per session and re-probed lazily, so an MCP
       // reload that connects Symvanta mid-session still arms the guard, and a
@@ -629,9 +1012,17 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
       const target = gatedTarget(input, cwd);
       if (target === null) return;
 
-      state.blocks += 1;
       const relative = path.relative(cwd, target) || target;
-      const reason = blockReason(relative, state.tools);
+      if (!impactBlocks(state.impactMode)) {
+        // `warn`: the mutation runs, and the note beside it says which check
+        // would have covered it. Captured per file so a batch of edits to one
+        // file is advised once.
+        sendGuidance(pi, state, "warn", guideKey("warn", relative), warnGuidance(relative, state.tools));
+        return;
+      }
+
+      state.blocks += 1;
+      const reason = blockReason(relative, state.tools, state.impactMode);
       if (ctx.hasUI) {
         try {
           ctx.ui.notify(`Symvanta impact guard refused an edit to ${relative}: run an impact check first.`, "warning");
@@ -646,13 +1037,15 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event, ctx) => {
-    // Satisfaction is decided here and nowhere else: the gate opens only for an
-    // impact check that actually completed successfully, so a check that is
-    // still running, or one that failed, leaves it shut. Notification only
-    // otherwise: this never patches a result.
+    // Three things happen here, and none of them patches the result:
+    // satisfaction is decided, the status widget is fed, and an empty search is
+    // rescued. Satisfaction is decided here and nowhere else: the gate opens
+    // only for an impact check that actually completed successfully, so a check
+    // that is still running, or one that failed, leaves it shut.
     try {
-      const record = event as { toolName?: unknown; input?: unknown; isError?: unknown; error?: unknown };
-      const state = stateFor(ctx as HandlerContext);
+      const record = eventRecord(event);
+      const handlerContext = ctx as HandlerContext;
+      const state = stateFor(handlerContext);
       const callId = toolCallIdOf(event);
       // Matching the id pairs this result with the check this session issued.
       // The identity test is the fallback for a check whose `tool_call` this
@@ -662,6 +1055,19 @@ export default function symvantaPlugin(pi: ExtensionAPI) {
       if (!failed && (pending || isImpactCheckCall(record.toolName, record.input))) {
         state.impactObserved = true;
       }
+
+      // The status widget reads only the three tools that describe the index,
+      // and only when the call succeeded; a failed or unrecognized result
+      // changes nothing, so the last real observation stays on screen. An
+      // `init` result also carries what it observed about attachment, which is
+      // what opens the augmenters and the guard for this session.
+      const status = statusFromToolResult(symvantaToolName(record.toolName), record);
+      if (status !== null) {
+        if (status.attached !== null) state.attached = status.attached;
+        publishStatus(handlerContext, status);
+      }
+
+      guideRescue(pi, state, record);
     } catch {
       return;
     }

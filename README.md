@@ -8,12 +8,18 @@ under oh-my-pi. Installing this plugin:
   config;
 - injects repository binding context at session start, so the agent calls `init`
   with this checkout's `owner/name` instead of guessing which project to read;
-- gates the first edit of existing code on a real impact check, so a change lands
-  only after `relate` (kind:blast_radius) or `estimate_scope` has completed
-  successfully for it;
-- ships an always-apply navigation rule, eight `/symvanta-*` commands, and the
-  `symvanta` skill, so graph-first navigation is the default path rather than an
-  option you have to remember.
+- gates edits of existing code on a real impact check, with selectable modes, so
+  a change lands only after `relate` (kind:blast_radius) or `estimate_scope` has
+  completed successfully for it;
+- ships two task agents (`symvanta-explorer`, `symvanta-tracer`), an always-apply
+  navigation rule, twelve `/symvanta-*` commands, and the `symvanta` skill, so
+  graph-first navigation is the default path rather than an option you have to
+  remember;
+- adds guidance-only augmentation: hidden prompt guidance plus local-search
+  nudges and an empty-`grep` rescue that point the agent at the graph without
+  ever querying it on its own;
+- shows an observation-only status line and below-editor widget built from
+  `init`, `freshness`, and `index_health` results the agent already fetched.
 
 ## Requirements
 
@@ -25,7 +31,17 @@ under oh-my-pi. Installing this plugin:
 
 ## Install
 
-### From GitHub (recommended)
+There are two lanes. They differ in what they install, where it lives, and the
+names OMP registers, so pick one and use its names throughout.
+
+| | Direct Git install | Marketplace install |
+| --- | --- | --- |
+| Scope | user-wide (every checkout) | project (`--scope project`) |
+| MCP server name | `symvanta` | `symvanta:symvanta` |
+| Command names | `/symvanta-ask` and the other eleven | `/symvanta-ask` and the other eleven through the extension aliases, plus the namespaced file commands `symvanta:symvanta-*` |
+| Uninstall | `omp plugin uninstall @symvanta/omp-plugin` | `omp plugin uninstall --scope project symvanta@symvanta-omp` |
+
+### From GitHub (direct, user-wide)
 
 ```
 omp plugin install github:Symvanta/omp-plugin
@@ -38,25 +54,34 @@ register as `/symvanta-*`, unchanged.
 A Git install is user-wide. The plugin lands in the user-wide plugin root and
 loads from every checkout, and the installer's `--scope` flag is honored only for
 marketplace installs (`name@marketplace`), so adding a project scope to a Git
-install changes nothing. Where project-level control is wanted, MCP server
-definitions are the scope-aware part of OMP:
-`/mcp add symvanta --url <endpoint> --scope project` and
-`/mcp remove symvanta --scope project` act on the project scope, while installing
-or removing the plugin itself always acts on the user plugin root.
+install changes nothing. Where project-level control is wanted, use the
+marketplace lane below, or scope the MCP server definition itself with
+`/mcp add symvanta --url <endpoint> --scope project`.
 
 `omp plugin list` shows the registered plugins, and `omp plugin doctor` reports
 drift in plugin state (`omp plugin doctor --fix` repairs what it can).
 
-### Why this release ships no marketplace catalog
+### From the marketplace (project-scoped)
 
-Marketplace installs route a plugin through OMP's namespace rewriting, which
-prefixes the command and MCP server names it registers. A catalog entry would
-therefore install commands that are not the `/symvanta-*` commands and a server
-that is not the `symvanta` server documented here, and every name below would be
-wrong for a marketplace user. This release ships no catalog: install from GitHub
-(above) or link a checkout (below). A catalog may only return alongside an
-explicit `## Marketplace namespacing` section documenting the rewritten names,
-which `scripts/validate.mjs` enforces.
+The repository ships a catalog at `.omp-plugin/marketplace.json` (marketplace
+name `symvanta-omp`, plugin name `symvanta`), so it can be added as a marketplace
+and installed into one project:
+
+```
+omp plugin marketplace add Symvanta/omp-plugin
+omp plugin install --scope project symvanta@symvanta-omp
+```
+
+A project-scoped install lives in `<project>/.omp/plugins/` and is available only
+in that project; a user-scoped marketplace install (`--scope user`, or omitting
+the flag) is also possible and is available in every project. Project-scoped
+installs shadow user-scoped installs of the same plugin ID. The in-session
+equivalents are `/marketplace add Symvanta/omp-plugin` and
+`/marketplace install --scope project symvanta@symvanta-omp`.
+
+Marketplace installs route the plugin through OMP's name rewriting, so read
+[Marketplace namespacing](#marketplace-namespacing) before you type a server or
+command name.
 
 ### From a local checkout (development)
 
@@ -68,6 +93,27 @@ omp plugin link /path/to/omp-plugin
 copying it, so edits in the working tree are what the next reload loads. There is
 no cached copy to update and no reinstall step.
 
+## Marketplace namespacing
+
+A marketplace install is namespaced: OMP prefixes every command and MCP server
+name the plugin contributes with the plugin name, while a direct Git install
+keeps the plain names. Concretely, for plugin name `symvanta` published by
+marketplace `symvanta-omp`:
+
+- the MCP server in `.mcp.json` (`symvanta`) registers as `symvanta:symvanta`, so
+  every `/mcp` subcommand takes that name: `/mcp test symvanta:symvanta`,
+  `/mcp reauth symvanta:symvanta`, `/mcp unauth symvanta:symvanta`;
+- the markdown commands in `commands/` register as `symvanta:symvanta-ask`,
+  `symvanta:symvanta-blast`, and so on;
+- the extension module registers command aliases for all twelve stable
+  `/symvanta-*` names, so `/symvanta-ask`, `/symvanta-blast`, and the rest keep
+  working in both lanes. Extension commands are dispatched before file commands,
+  so the aliases win and the namespaced copies remain available.
+
+A direct Git install has no rewriting: the server is `symvanta` and the commands
+are `/symvanta-*`, with no aliases needed. When in doubt, `/mcp list` shows the
+server name that actually registered, and `/reload-plugins` lists the commands.
+
 ## Reload and restart
 
 Plugin state is read at defined points, not continuously:
@@ -75,8 +121,8 @@ Plugin state is read at defined points, not continuously:
 | Change | What picks it up |
 | --- | --- |
 | Skills, slash commands, MCP servers | `/reload-plugins` |
-| The extension module (session-start context, session-switch primer, pre-edit gate) | restart the session |
-| MCP server definitions only | `/mcp reload`, or `/mcp reconnect symvanta` |
+| The extension module (session-start context, session-switch primer, impact gate, augmenters, status widget) | restart the session |
+| MCP server definitions only | `/mcp reload`, or `/mcp reconnect <server>` |
 
 `omp plugin install`, `omp plugin link`, and `omp plugin uninstall` mutate disk
 state and invalidate discovery caches; they do not rebuild the session you are
@@ -88,20 +134,23 @@ behind slash commands or skills.
 
 Every Symvanta MCP server (Cloud, staging, or on-prem) advertises its own OAuth
 endpoints, so OMP runs the browser sign-in on first connection and there is
-nothing to configure in the plugin. The credential is stored by OMP's auth
-storage or broker, keyed to the server URL, and refreshed by OMP itself.
+nothing to configure in the plugin. The credential is stored and refreshed by
+OMP's auth storage or broker, keyed to the server URL; the plugin never reads it
+and never talks to the endpoint itself.
 
 ```
-/mcp list                  # confirm the symvanta server and which config it came from
-/mcp test symvanta         # connect now and list the tools it serves
-/mcp reconnect symvanta    # reconnect this server without rediscovering every config
-/mcp reauth symvanta       # replace the stored OAuth credential
-/mcp unauth symvanta       # remove the stored credential
+/mcp list                        # confirm the registered server name for your lane
+/mcp test symvanta               # direct Git install
+/mcp test symvanta:symvanta      # marketplace install
+/mcp reconnect symvanta          # reconnect this server without rediscovering every config
+/mcp reauth symvanta             # replace the stored OAuth credential
+/mcp unauth symvanta             # remove the stored credential
 ```
 
-Run `/mcp reauth symvanta` after a credential expires, after signing in as a
+Run `/mcp reauth <server>` after a credential expires, after signing in as a
 different account, or after changing `SYMVANTA_MCP_URL` (a new URL is a new
-credential binding).
+credential binding). Under a marketplace install, `<server>` is
+`symvanta:symvanta`.
 
 ## Configuration
 
@@ -123,16 +172,82 @@ host or a trailing slash fails to connect. Existing sessions keep the URL they
 discovered, so run `/mcp reload` (and re-authorize if the URL changed) after
 editing the variable.
 
-### Turn the pre-edit gate off
+### Impact modes
 
-The impact gate blocks only the first edit or write of existing code until an
-impact check has completed successfully in that session. It is per session, not
-per turn: once a check succeeds, later edits in the same session are ungated. To
-disable it entirely (it then never blocks anything):
+`SYMVANTA_IMPACT_MODE` selects how the pre-edit gate behaves. Values are trimmed
+and case-insensitive; an unknown value falls back to `once`.
+
+| Mode | Behavior |
+| --- | --- |
+| `once` (default) | Refuses the first edit or write of existing code until a `relate` (kind:blast_radius) or `estimate_scope` call has completed successfully in this session. Once a check succeeds, later edits are ungated. |
+| `strict` | Refuses every edit or write of existing code until an impact check completes successfully, and never stops refusing after a fixed number of refusals: if the server never answers, the mutation stays refused instead of failing open. |
+| `warn` | Never blocks. An unchecked edit or write of existing code runs, and a hidden note beside it names the check that would have covered it, once per file. |
+| `off` | No gating and no note. |
 
 ```
-export SYMVANTA_ENFORCE_IMPACT=off
+export SYMVANTA_IMPACT_MODE=warn
 ```
+
+The older switch is still honored when `SYMVANTA_IMPACT_MODE` is absent or
+invalid: `SYMVANTA_ENFORCE_IMPACT=off` (also `false`, `0`, or `no`) selects
+`off`. An explicit valid `SYMVANTA_IMPACT_MODE` always wins.
+
+The gate is observed-attachment aware, because a user-wide install loads in
+checkouts Symvanta has never seen. It stays silent until a successful `init`
+result reports `workspace.attached: true` for this session, and an `init` result
+that reports `workspace.attached: false` keeps it silent: no refusal and no
+advisory either way. The one exception is a check that already completed
+successfully: the agent asked for it explicitly, so it opens the gate whatever
+the last observation said. Only an `init` result carries this observation
+(`freshness` and `index_health` results never change it), and each new session
+starts unobserved.
+
+The gate is per session, not per turn. New files and non-code files always pass.
+When the Symvanta impact tools are not loaded, every mode fails open. Once those
+tools are present, `strict` continues refusing after a failed or unavailable
+impact result until one completes successfully.
+
+### Guidance augmenters
+
+The extension can add hidden, guidance-only context: a prompt primer that tells
+the agent to prefer the graph, a one-time nudge after local `grep`, `glob`, or
+`bash` searches on an attached repository, a one-time nudge after `read`, and a
+rescue when a `grep` comes back empty (call `locate` with no mode so it
+auto-routes to semantic search). The read nudge is keyed to the file, so any
+selector the read tool accepts
+(`:50`, `:50-200`, `:50+150`, `:-60`, `:5-16,960-973`, `:50..100`, `:raw`,
+`:img`, `:conflicts`, and mode words mixed with ranges like `:raw:2-4`) is the
+same file and earns one note. The rescue fires only for a search that found
+nothing: a `No more results` page, which is paging past the end of a search that
+did match, is not an empty search. The tool nudges are deduped per session per
+subject, while the prompt note is deterministic: the same submission, including
+a retry OMP runs after a source-base change, gets the same note. None of them
+query the graph, read credentials, or make network requests: they are text the
+agent may act on with its own tool calls.
+
+Every augmenter has a switch. Values are trimmed and case-insensitive, and `off`,
+`false`, `0`, or `no` disables the feature.
+
+| Variable | Turns off |
+| --- | --- |
+| `SYMVANTA_AUGMENT` | every augmenter below |
+| `SYMVANTA_AUGMENT_PROMPT` | the prompt routing note |
+| `SYMVANTA_AUGMENT_SEARCH` | the `grep`/`glob`/`bash` search note |
+| `SYMVANTA_AUGMENT_READ` | the first-read note |
+| `SYMVANTA_AUGMENT_RESCUE` | the empty-`grep` rescue |
+| `SYMVANTA_AUGMENT_DEDUPE` | the tool-guidance dedupe, so those notes may repeat (the prompt note is deterministic by design and unaffected) |
+
+```
+export SYMVANTA_AUGMENT_SEARCH=off
+```
+
+`SYMVANTA_AUGMENT=off` disables every augmenter (the impact gate and the status
+widget are unaffected).
+
+Every augmenter is also observed-attachment aware: none of them add anything
+until a successful `init` result reports `workspace.attached: true`, and an
+unattached result keeps them silent, so a user-wide install never advises routing
+through a graph that does not have this checkout.
 
 ### Timeout
 
@@ -145,24 +260,58 @@ timeouts.
 ## Commands
 
 Each command routes to the right graph tool so you do not have to remember tool
-names:
+names. All twelve are registered by the extension as stable `/symvanta-*` aliases
+in both install lanes. Arguments are inserted literally: the template's
+`$ARGUMENTS` (or `$@`) placeholder is replaced, and anything in your own text
+that looks like a replacement pattern (`$&`, `` $` ``, `$'`, `$$`, `$1`,
+`$<name>`, `$@`) stays exactly as you typed it, because the substitution is a
+single pass that never rescans what it inserted.
 
 | Command | What it does |
 | --- | --- |
-| `/symvanta-ask [question]` | Answer a behavior question ("how does X work", "why does Y happen") from the graph, with file citations. |
-| `/symvanta-blast [symbol]` | Blast-radius check before editing a symbol: what breaks across files, layers, and repositories. Satisfies the pre-edit gate. |
-| `/symvanta-trace [symbol]` | Full call chain, direct callers, and dependencies of a symbol. |
-| `/symvanta-status [repository]` | Bound project, indexed repositories, freshness, and graph density. The pre-edit gate lives inside the extension process, so the command reports it as in-process state rather than querying it. |
-| `/symvanta-architecture [repository]` | Functional modules, their hubs, cross-module coupling, and the load-bearing functions. |
-| `/symvanta-scope [symbol or change]` | Pre-flight scope estimate for a change, grounded in the graph instead of guessed call sites. |
-| `/symvanta-tests [symbol]` | The existing tests that cover a symbol. |
-| `/symvanta-working-tree [repository]` | Overlay uncommitted edits so graph, text, and symbol tools reflect unpushed work. |
+| `/symvanta-ask [question]` | Answer a behavior question ("how does X work", "why does Y happen", "what triggers Z") from the graph, with file citations. |
+| `/symvanta-blast [symbol or path:symbol]` | Blast-radius check before editing a symbol: what breaks across files, layers, and repositories. Satisfies the pre-edit gate. |
+| `/symvanta-trace [symbol]` | Trace a symbol: full call chain, direct callers, and dependencies, instead of reading files one by one. |
+| `/symvanta-status [repository (optional)]` | Connection and index health snapshot: bound project, indexed repositories, freshness, graph density, and MCP wiring. |
+| `/symvanta-architecture [repository (optional)]` | High-level architecture of the indexed codebase: functional modules, their hubs, cross-module coupling, and the load-bearing functions. |
+| `/symvanta-scope [symbol or change description]` | Pre-flight scope estimate for a change before sizing or planning it, grounded in the graph instead of a guess at call sites. |
+| `/symvanta-tests [symbol]` | Find the existing tests that cover a symbol, from the graph rather than by guessing at test file names. |
+| `/symvanta-working-tree [repository (optional)]` | Overlay uncommitted working-tree edits onto a synthetic indexed revision so graph, text, and symbol tools reflect unpushed changes. |
+| `/symvanta-route [route path] [method (optional)]` | Resolve an HTTP route to the handler and middleware that serve it, from framework router metadata instead of a grep for the URL string. |
+| `/symvanta-branch [branch name, or clear (optional)]` | Pin this session's graph reads to a tracked branch, or drop the pin, so results describe that branch instead of the default branch. |
+| `/symvanta-recent [path (optional)]` | Recent indexed history: the files changing most often, and the latest commits, optionally scoped to one path. |
+| `/symvanta-clear [branch \| working-tree \| project (optional)]` | Drop the Symvanta session pin: the branch or working-tree revision pin by default, and the project binding only when explicitly asked. |
+
+## Agents
+
+The plugin ships two OMP task agents. Dispatch them with the `task` tool by name,
+or let the policy in the rule pick them for graph-shaped work:
+
+- `symvanta-explorer` explores an attached repository through the graph before
+  any local search: bind, orient, then read only what the graph points at.
+- `symvanta-tracer` follows a symbol: callers, dependencies, blast radius, and
+  the call chain that reaches it.
+
+Both are read-only investigators: they answer with graph-grounded citations and
+never edit files.
+
+## Status widget
+
+The extension registers an observation-only status line and a below-editor
+widget. They render only what successful `init`, `freshness`, and `index_health`
+tool results already reported in this session (bound repository, index freshness,
+indexed repository count), and they say nothing when no such result has arrived
+yet. An `init` result that reports `workspace.attached: false` is mirrored as
+`not attached`, which is the same result that keeps the gated features silent.
+The widget never queries the graph, never reads credentials, and never changes
+what the agent does; it is a mirror of results the agent fetched, not a second
+client.
 
 ## What runs at runtime
 
 The plugin is one extension module (`src/index.ts`) plus a pure helper
-(`src/repository.js`), a rule, eight commands, and a skill. It registers five
-event handlers:
+(`src/repository.js`), a rule, twelve commands, two agents, and a skill. It
+registers these event handlers:
 
 - **`session_start`** reads the checkout's git remote (`git config --get
   remote.origin.url`, via `execFile` with no shell and a timeout), derives
@@ -173,33 +322,51 @@ event handlers:
   work without the graph. Nothing is sent anywhere at session start.
 - **`session_switch`** re-runs the session-start routine when the switch reason
   is `new`, which is what `/new` emits when the runtime swaps in an empty
-  transcript inside the same process: the primer is queued again and the guard
-  starts over, so a fresh conversation neither loses the binding nor inherits the
-  previous transcript's satisfied gate. Other reasons (`switch`, `fork`,
-  `resume`) carry the transcript they loaded, so nothing is reissued for them.
-- **`tool_call`** watches the agent's own tool calls. It blocks **one** thing: the
-  first `edit`/`write` that would modify existing code, when no impact check has
-  completed yet in this session. Once a `relate` (kind:blast_radius) or
-  `estimate_scope` call finishes successfully, the gate opens for the rest of the
-  session; a check that is still running, or one that failed, does not open it.
-  New files and non-code files pass untouched, and if the graph is unreachable
-  (no Symvanta tools, server down) the gate fails open rather than wedging the
-  session. `SYMVANTA_ENFORCE_IMPACT=off` disables it. Edit targets are read from
-  every wire shape the host can send: the `path`/`file_path`/`filePath` fields
-  and their plural siblings, a path array, and patch payloads in each dialect the
-  host emits, the hashline `[path#hash]` sections, the `*** Update File:`,
-  `*** Delete File:` and `*** Add File:` markers, and the sloppy-mode
-  `*** SM:EDIT path` and `<SM:EDIT path="...">` spellings (the attribute may also
-  be spelled `file=`). A quoted path, a copied `[path]` or `[path#hash]` wrapper,
-  a `~/` home prefix, and the OMP path aliases `file:///absolute`, `@/absolute`,
-  `@~/` and `:/absolute` are all normalized before the target is checked; a
-  target that names a non-file scheme (`https://`, `xd://`) is skipped instead of
-  being resolved against the checkout.
+  transcript inside the same process: the primer is queued again, the previous
+  session's status line and widget are cleared (even though the new transcript
+  has a new session id), and the guard starts over, so a fresh conversation
+  neither loses the binding nor inherits the previous transcript's satisfied
+  gate. Other reasons (`switch`, `fork`, `resume`) carry the transcript they
+  loaded, so nothing is reissued for them.
+- **`before_agent_start`** reads the prompt being prepared and, when it names
+  symbol-shaped terms, returns one hidden, agent-attributed companion message
+  naming the graph calls that would resolve them. It is deterministic per
+  submission: the same prompt, including a retry OMP runs after a source-base
+  change, gets the same note, and the note is claimed by no counter, because a
+  note claimed by a discarded attempt would be lost. It is silent until an
+  `init` result has observed `workspace.attached: true`.
+- **`tool_call`** watches the agent's own tool calls. It refuses edits according
+  to `SYMVANTA_IMPACT_MODE`: in `once` it blocks the first `edit`/`write` that
+  would modify existing code when no impact check has completed yet, then
+  latches open once one succeeds; in `strict` it keeps refusing until a check
+  completes and never fails open; `warn` adds a hidden note instead of blocking;
+  `off` does nothing. The same handler recognizes local searches and code reads
+  and adds the guidance-only asides, which never block or rewrite a call. Both
+  stay silent until an `init` result has observed `workspace.attached: true`
+  (see [Impact modes](#impact-modes)), because a user-wide install may be
+  running in a checkout Symvanta has never indexed. New files and non-code files
+  pass untouched. If the Symvanta impact tools are not loaded, the guard fails
+  open; once they are present, `strict` keeps refusing until a check succeeds.
+  Edit targets are read from every wire shape
+  the host can send: the `path`/`file_path`/`filePath` fields and their plural
+  siblings, a path array, and patch payloads in each dialect the host emits, the
+  hashline `[path#hash]` sections, the `*** Update File:`, `*** Delete File:` and
+  `*** Add File:` markers, and the sloppy-mode `*** SM:EDIT path` and
+  `<SM:EDIT path="...">` spellings (the attribute may also be spelled `file=`). A
+  quoted path, a copied `[path]` or `[path#hash]` wrapper, a `~/` home prefix, and
+  the OMP path aliases `file:///absolute`, `@/absolute`, `@~/` and `:/absolute`
+  are all normalized before the target is checked; a target that names a non-file
+  scheme (`https://`, `xd://`) is skipped instead of being resolved against the
+  checkout.
 - **`tool_result`** decides whether that check counted. It tracks impact calls by
   tool call id while they are in flight and opens the gate only for one that
   completed successfully, so a check issued in the same batch as an edit cannot
-  wave that edit through, and a failed check leaves the gate shut. It never
-  patches a result.
+  wave that edit through, and a failed check leaves the gate shut. The same
+  result stream feeds the augmenters (search/read nudges, empty-grep rescue) and
+  the status widget, all read-only, and records the attachment observation: only
+  a successful `init` result carrying a literal boolean `workspace.attached`
+  moves it, and that observation is what lets the gate and the augmenters speak.
+  It never patches a result.
 - **`session_shutdown`** drops this session's gate state, including any call that
   was still pending, so nothing leaks into the next session in the process.
 
@@ -233,7 +400,8 @@ tools through the host.
 OMP does not need it, and this plugin deliberately does not reproduce it:
 
 - the extension runs in-process on OMP's event bus, so it can observe tool calls
-  (the pre-edit gate) without spawning a process per tool call;
+  (the pre-edit gate) and add hidden guidance (the augmenters) without spawning a
+  process per tool call;
 - MCP auth stays broker-managed by OMP: the extension never reads a credential
   file, never holds a token, and never makes a direct HTTP request;
 - the standing policy lives in an always-apply rule, which is injected into the
@@ -244,6 +412,12 @@ OMP does not need it, and this plugin deliberately does not reproduce it:
 - No telemetry, no analytics, no background processes, and no daemon.
 - The extension makes no network requests at all. It reads the checkout's git
   remote and file extensions locally, and talks to OMP through the event bus.
+  The augmenters only add text to prompts and tool results; they never call the
+  graph themselves, so nothing in this plugin fabricates a graph answer.
+- Nothing gated speaks about a checkout Symvanta has not confirmed: until a
+  successful `init` result reports `workspace.attached: true`, the impact gate
+  and every augmenter add nothing, and an unattached result keeps them quiet for
+  the rest of the session unless a later `init` result says otherwise.
 - Every graph query is an MCP tool call the agent decides to make, over the same
   HTTPS connection and OAuth credential you authorized, through OMP's MCP client.
   What leaves the machine is exactly those tool arguments (identifiers, task
@@ -251,42 +425,42 @@ OMP does not need it, and this plugin deliberately does not reproduce it:
   unless a tool call explicitly asks for them.
 - The plugin writes no caches, logs, or state files of its own. Credentials live
   in OMP's auth storage; uninstall does not touch them (see below).
-- The repository is public and small enough to read end to end: `src/index.ts`
-  and `src/repository.js` are the entire runtime.
+- The repository is private for now, and small enough to read end to end:
+  `src/index.ts` and its runtime modules are the entire runtime.
 
 ## Uninstall
 
-Both install paths register the plugin under its package name, so one command
-removes it:
+Each install lane uninstalls under its own identity:
 
 ```
-omp plugin uninstall @symvanta/omp-plugin
+omp plugin uninstall @symvanta/omp-plugin                      # direct Git install
+omp plugin uninstall --scope project symvanta@symvanta-omp     # marketplace install
 ```
 
 `omp plugin list` shows the registered name if you are unsure of the spelling.
 Uninstall removes the registration and any copy OMP made at install time; a
 linked checkout is only unlinked, so its working tree stays on disk. Neither case
-removes the OAuth credential: drop it with `/mcp unauth symvanta` if you also
-want to sign out.
+removes the OAuth credential: drop it with `/mcp unauth symvanta` (or
+`/mcp unauth symvanta:symvanta` for the marketplace lane) if you also want to
+sign out.
 
 ## Layout
 
 ```
+.omp-plugin/marketplace.json   marketplace catalog (symvanta-omp / symvanta, source ./)
 .mcp.json                      Symvanta MCP server definition (http, env-overridable URL)
 package.json                   omp.extensions manifest
-src/index.ts                   session_start context, session-switch primer, pre-edit impact gate
+src/index.ts                   session context, impact gate, augmenters, status widget, command aliases
 src/repository.js              git-remote parsing and startup-context text (pure)
 rules/symvanta.md              always-apply navigation policy (rule://symvanta)
-commands/symvanta-*.md         the eight slash commands
+commands/symvanta-*.md         the twelve slash commands
+agents/symvanta-*.md           the explorer and tracer task agents
 skills/symvanta/SKILL.md       tool decision matrix and conventions
 scripts/validate.mjs           dependency-free contract validator
 test/validate.test.mjs         validator contract tests and the extension's static contract
+test/extension.test.mjs        behavioral tests driving the extension with a fake ExtensionAPI
 test/repository.test.mjs       startup-context and git-remote parsing tests
 ```
-
-There is no `.omp-plugin/marketplace.json`: this release is installed from the
-repository itself, so the catalog entry (and the namespace rewriting it triggers)
-is not shipped.
 
 Run the contract validator with `node scripts/validate.mjs`; run the tests with
 `node --test`. Both use Node built-ins only and need no install step.

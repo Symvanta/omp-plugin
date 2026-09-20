@@ -6,18 +6,23 @@
 //
 // Check codes (every violation is reported as "<code>: <message>"):
 //   package.*   package.json manifest: name, version, type, omp.extensions, declared paths
-//   catalog.*   marketplace catalog: absent from this release at every known path
-//               (.omp-plugin/, .claude-plugin/, repo root), and rejected when it
-//               returns without the namespace rewriting documented in README.md
+//   catalog.*   marketplace catalog: present at .omp-plugin/marketplace.json with this
+//               repository's identity and a relative source that resolves to the repo
+//               root, alone (no stray Claude or root catalog), and documented in the
+//               README's namespacing section
 //   mcp.*       Symvanta MCP server definition: transport, URL default/override, timeout
 //   rule.*      rules/*.md frontmatter and the always-apply policy requirements
 //   command.*   commands/symvanta-*.md names, frontmatter, argument placeholder, host-neutral tools
+//   agent.*     agents/symvanta-*.md names, frontmatter, read-only tool set
 //   skill.*     skills/symvanta/SKILL.md presence and frontmatter
-//   runtime.*   src/index.ts static behavior: session_start/session_switch context, pre-edit
-//               impact gate, defensive tool-name resolution, no credential reads, no direct HTTP
-//   readme.*    README documents the direct Git install, the package-name uninstall, OAuth,
-//               reload, privacy, and the hook rationale
-//   host.*      no Claude-only or marketplace-only reference in a shipped artifact
+//   runtime.*   the extension and its modules: session_start/session_switch context, pre-edit
+//               impact gate and its modes, command aliases, guidance-only augmenters,
+//               observation-only status widget, defensive tool-name resolution, no credential
+//               reads, no direct HTTP and no fetch
+//   readme.*    README documents both install lanes and their names, the impact modes, the
+//               agents, the augmenters, the observation-only widget, OAuth, reload, privacy,
+//               and the hook rationale
+//   host.*      no Claude-only wiring reference in a shipped artifact
 //   hooks.*     no Claude Code hooks.json (OMP wires hooks as extension events)
 //
 // Usage: node scripts/validate.mjs
@@ -31,22 +36,39 @@ import { fileURLToPath } from 'node:url';
 
 export const PLUGIN_NAME = 'symvanta';
 export const PACKAGE_NAME = '@symvanta/omp-plugin';
-export const PACKAGE_VERSION = '0.1.0';
+export const PACKAGE_VERSION = '0.2.0';
 export const EXTENSION_ENTRIES = ['./src/index.ts'];
 export const REPOSITORY = 'Symvanta/omp-plugin';
 export const MCP_URL = '${SYMVANTA_MCP_URL:-https://mcp.symvanta.com/mcp}';
 export const MCP_TIMEOUT_MS = 120000;
 
-/** The documented install: this repository, so the names below stay the names a consumer types. */
+/** The marketplace lane: catalog name, plugin entry name, and the plugin id a consumer types. */
+export const MARKETPLACE_NAME = 'symvanta-omp';
+export const MARKETPLACE_ID = `${PLUGIN_NAME}@${MARKETPLACE_NAME}`;
+
+/** The MCP server name each lane registers: plain for a Git install, prefixed by the marketplace. */
+export const SERVER_DIRECT = PLUGIN_NAME;
+export const SERVER_MARKETPLACE = `${PLUGIN_NAME}:${PLUGIN_NAME}`;
+
+/** The documented direct install: this repository, so the names below stay the names a consumer types. */
 export const INSTALL_COMMAND = `omp plugin install github:${REPOSITORY}`;
 
-/** Uninstall goes by package name for both install paths. */
+/** The documented marketplace lane: add the catalog, then install it into one project. */
+export const MARKETPLACE_ADD_COMMAND = `omp plugin marketplace add ${REPOSITORY}`;
+export const MARKETPLACE_INSTALL_COMMAND = `omp plugin install --scope project ${MARKETPLACE_ID}`;
+export const MARKETPLACE_UNINSTALL_COMMAND = `omp plugin uninstall --scope project ${MARKETPLACE_ID}`;
+
+/** The direct install goes by package name. */
 export const UNINSTALL_COMMAND = `omp plugin uninstall ${PACKAGE_NAME}`;
 
 export const COMMANDS = [
   'symvanta-ask',
   'symvanta-architecture',
   'symvanta-blast',
+  'symvanta-branch',
+  'symvanta-clear',
+  'symvanta-recent',
+  'symvanta-route',
   'symvanta-scope',
   'symvanta-status',
   'symvanta-tests',
@@ -54,11 +76,74 @@ export const COMMANDS = [
   'symvanta-working-tree',
 ];
 
-const CATALOG_FILES = ['.omp-plugin/marketplace.json', '.claude-plugin/marketplace.json', 'marketplace.json'];
+export const AGENTS = ['symvanta-explorer', 'symvanta-tracer'];
+
+const CATALOG_FILE = '.omp-plugin/marketplace.json';
+const STRAY_CATALOG_FILES = ['.claude-plugin/marketplace.json', 'marketplace.json'];
 const RULE_FILE = 'rules/symvanta.md';
 const SKILL_FILE = 'skills/symvanta/SKILL.md';
 const EXTENSION_FILE = 'src/index.ts';
 const REPOSITORY_MODULE = 'src/repository.js';
+const IMPACT_MODULE = 'src/impact.js';
+const AUGMENT_MODULE = 'src/augment.js';
+const STATUS_MODULE = 'src/status.js';
+const COMMANDS_MODULE = 'src/commands.js';
+
+/** Modules the extension loads: the event wiring plus the pure helpers it delegates to. */
+const RUNTIME_MODULES = [EXTENSION_FILE, REPOSITORY_MODULE, IMPACT_MODULE, AUGMENT_MODULE, STATUS_MODULE, COMMANDS_MODULE];
+
+/** Helpers that must stay dependency-free: parsing and text building, no imports, no I/O. */
+const PURE_MODULES = [REPOSITORY_MODULE, IMPACT_MODULE, AUGMENT_MODULE, STATUS_MODULE];
+
+/**
+ * A pure helper may import a sibling pure helper, but nothing else: no core
+ * module, no package, no environment read, no I/O. Those are what make the
+ * module safe to load and call from a test without a session.
+ */
+const PURE_MODULE_VIOLATIONS = [
+  ['core module import', /\brequire\s*\(|["']node:[^"']*["']/],
+  ['external package import', /\bfrom\s+["'][^."']/],
+  ['side-effect package import', /\bimport\s+["'][^."']/],
+  ['environment read', /\bprocess\.env/],
+];
+
+/** Tools an agent definition may hand to a read-only investigator. */
+const AGENT_ALLOWED_TOOLS = new Set([
+  'read',
+  'grep',
+  'glob',
+  'web_search',
+  'task',
+  'hub',
+  'ast_grep',
+  'lsp',
+  'find_node',
+  'locate',
+  'relate',
+  'context',
+  'ask_codebase',
+  'quick_lookup',
+  'map',
+  'init',
+  'freshness',
+  'index_health',
+  'history',
+  'adr',
+  'library',
+  'list_file_symbols',
+  'list_tests_for',
+  'find_http_route',
+  'estimate_scope',
+  'diff_impact',
+  'list_repositories',
+  'list_projects',
+  'source',
+  'ref',
+  'bundle',
+]);
+
+/** Tools that mutate the workspace, which a read-only investigator must not carry. */
+const AGENT_FORBIDDEN_TOOLS = new Set(['edit', 'write', 'apply_patch', 'bash', 'python', 'eval']);
 
 // Frontmatter keys the rule loader understands (buildRuleFromMarkdown). An
 // unknown key is silently ignored at runtime, which is exactly how a typo like
@@ -92,17 +177,42 @@ const RULE_REQUIREMENTS = [
   ['indexed-workspace check', /attached/i],
 ];
 
-const EXPECTED_EVENTS = ['session_start', 'session_switch', 'tool_call'];
-const EXPECTED_RUNTIME_TOKENS = ['blast_radius', 'estimate_scope', 'SYMVANTA_ENFORCE_IMPACT'];
+const EXPECTED_EVENTS = [
+  'session_start',
+  'session_switch',
+  'tool_call',
+  'tool_result',
+  'session_shutdown',
+  'before_agent_start',
+];
+
+// Tokens each capability is carried by, scanned across every runtime module so a
+// helper can own the behavior without the event wiring repeating its name. The
+// impact modes, the augment switch, and the status sources are the shipped
+// contracts a consumer sets or reads; a rename here is a break.
+const EXPECTED_RUNTIME_TOKENS = [
+  'blast_radius',
+  'estimate_scope',
+  'SYMVANTA_ENFORCE_IMPACT',
+  'SYMVANTA_IMPACT_MODE',
+  'SYMVANTA_AUGMENT',
+  'index_health',
+  'freshness',
+  'setWidget',
+  'setStatus',
+  'belowEditor',
+];
 
 // Behaviors the extension cannot prove by running here: the module is TypeScript
-// loaded by OMP, so each one is pinned to the code identifier that carries it.
-// The namespace read and the known-tool table are what let a rewritten install's
-// wire name still resolve to a bare Symvanta tool; the patch constants are how a
-// payload names its files, including the sloppy `path=`/`file=` attribute; and
-// the alias step is what turns a `file:///`, `@/`, `@~/`, `:/`, or `[path]`
-// target into the local path the guard can stat, while a foreign scheme names no
-// local file at all.
+// loaded by OMP, so each one is pinned to the identifier that carries it, across
+// every runtime module. The namespace read and the known-tool table are what let
+// a rewritten install's wire name still resolve to a bare Symvanta tool; the
+// patch constants are how a payload names its files, including the sloppy
+// `path=`/`file=` attribute; the alias step is what turns a `file:///`, `@/`,
+// `@~/`, `:/`, or `[path]` target into the local path the guard can stat, while
+// a foreign scheme names no local file at all; and the mode parser, augment
+// switch, status reader, and command table are the surfaces the README, the
+// commands, and the tests all name.
 const EXPECTED_RUNTIME_PATTERNS = [
   ['namespaced tool-name fallback', /\bSYMVANTA_NAMESPACE\b/],
   ['known Symvanta tool table', /\bSYMVANTA_TOOLS\b/],
@@ -113,6 +223,23 @@ const EXPECTED_RUNTIME_PATTERNS = [
   ['non-file scheme rejection', /\bURL_SCHEME\b/],
   ['sloppy path/file attribute', /\bSLOPPY_TAG_PATH\b/],
   ['home directory expansion', /\bhomedir\b/],
+  ['impact-mode parser', /\bparseImpactMode\b/],
+  ['impact-mode table', /\bIMPACT_MODES\b/],
+  ['legacy impact switch', /\bSYMVANTA_ENFORCE_IMPACT\b/],
+  ['augment switch parser', /\baugmentEnabled\b/],
+  ['augment dedupe switch', /SYMVANTA_AUGMENT_DEDUPE/],
+  ['status observation reader', /\bstatusFromToolResult\b/],
+  ['attachment observation state', /\bstate\.attached\b/],
+  ['attachment observation reset', /attached:\s*null/],
+  ['attachment observation applied', /\bstatus\.attached\b/],
+  ['stable command table', /\bSYMVANTA_COMMANDS\b/],
+  ['command alias registration', /registerCommand/],
+  ['command template rendering', /\brenderCommandTemplate\b/],
+  ['literal command arguments', /\bAGGREGATE_PLACEHOLDER\b/],
+  ['read selector ranges', /\bRANGE_CHUNK\b/],
+  ['pagination-aware rescue', /No more results/],
+  ['guidance message namespace', /symvanta\.guidance\./],
+  ['per-session augment dedupe', /\bdedup/i],
 ];
 
 // Code-side markers of the Claude Code hook shape: reading a credential file, or
@@ -122,6 +249,7 @@ const FORBIDDEN_RUNTIME_PATTERNS = [
   ['credential file read', /credentials\.json/],
   ['OAuth credential-store access', /mcp_oauth/],
   ['direct HTTP client', /node:https?/],
+  ['direct fetch call', /\bfetch\s*\(/],
 ];
 
 const CLAUDE_ISM_PATTERNS = [
@@ -136,49 +264,92 @@ const CLAUDE_ISM_PATTERNS = [
 const CLAUDE_TOOL_PREFIX = ['Claude MCP tool prefix', /mcp__/];
 
 // Defects a shipped artifact may not document:
-//   - a marketplace install, which is not part of this release (a catalog entry
-//     hands the plugin's commands and MCP server to OMP's namespace rewriting,
-//     so a consumer would get names this plugin does not register);
-//   - an install-scope claim: the installer honors `--scope` only for marketplace
-//     installs (`name@marketplace`), so a Git install is user-wide and a
-//     project-scoped install command is wrong.
+//   - a scope claim on the direct lane: the installer honors `--scope` only for
+//     marketplace installs (`name@marketplace`), so a project-scoped Git install
+//     or link is wrong (the marketplace lane below is the project-scoped one);
+//   - a marketplace plugin id other than this release's `symvanta@symvanta-omp`,
+//     which resolves to a different catalog entry.
 const ARTIFACT_PATTERNS = [
-  ['marketplace catalog command', /\bomp plugin marketplace\b/],
-  ['in-session marketplace command', /(?:^|\s)\/marketplace\b/],
-  ['catalog-scoped plugin name', /\bomp plugin (?:install|uninstall)\s+\S+@\S+/],
-  ['project-scoped install command', /\bomp plugin (?:install|link)\b[^\n]*--scope\s+project/],
+  ['scoped direct Git install command', /\bomp plugin (?:install|link)\b[^\n]*github:[^\n]*--scope/],
+  ['scoped local link command', /\bomp plugin link\b[^\n]*--scope/],
+  ['foreign marketplace plugin id', /\bomp plugin (?:install|uninstall)\b[^\n]*\s[a-z0-9][a-z0-9.-]*@(?!symvanta-omp\b)[a-z0-9][a-z0-9.-]*/],
 ];
 
 const COMMAND_ISM_PATTERNS = [...CLAUDE_ISM_PATTERNS, CLAUDE_TOOL_PREFIX, ...ARTIFACT_PATTERNS];
 const README_ISM_PATTERNS = [...CLAUDE_ISM_PATTERNS, ...ARTIFACT_PATTERNS];
 
-// The documented install and uninstall, bound to the manifest identity above so
-// the README cannot drift into a name the installer resolves differently.
+// The documented commands, bound to the manifest identity above so the README
+// cannot drift into a name the installer resolves differently.
 const README_CLI_SNIPPETS = [
   ['direct Git install', INSTALL_COMMAND],
   ['local link', 'omp plugin link'],
   ['package-name uninstall', UNINSTALL_COMMAND],
+  ['marketplace add', MARKETPLACE_ADD_COMMAND],
+  ['marketplace project install', MARKETPLACE_INSTALL_COMMAND],
+  ['marketplace project uninstall', MARKETPLACE_UNINSTALL_COMMAND],
+  ['marketplace plugin id', MARKETPLACE_ID],
   ['registered plugin list', 'omp plugin list'],
   ['plugin reload', '/reload-plugins'],
-  ['OAuth reauth', '/mcp reauth symvanta'],
-  ['OAuth credential removal', '/mcp unauth symvanta'],
+  ['session restart', 'restart the session'],
+  ['OAuth reauth', '/mcp reauth'],
+  ['OAuth credential removal', '/mcp unauth'],
   ['MCP URL override', 'SYMVANTA_MCP_URL'],
   ['Cloud default URL', 'https://mcp.symvanta.com/mcp'],
-  ['impact gate switch', 'SYMVANTA_ENFORCE_IMPACT'],
+  ['impact mode switch', 'SYMVANTA_IMPACT_MODE'],
+  ['legacy impact switch', 'SYMVANTA_ENFORCE_IMPACT'],
+  ['augment switch', 'SYMVANTA_AUGMENT'],
+  ['prompt augment switch', 'SYMVANTA_AUGMENT_PROMPT'],
+  ['search augment switch', 'SYMVANTA_AUGMENT_SEARCH'],
+  ['read augment switch', 'SYMVANTA_AUGMENT_READ'],
+  ['rescue augment switch', 'SYMVANTA_AUGMENT_RESCUE'],
+  ['dedupe augment switch', 'SYMVANTA_AUGMENT_DEDUPE'],
+  ['attachment observation', 'workspace.attached'],
+  ['literal command arguments', 'Arguments are inserted literally'],
+  ['read selector shapes', ':50+150'],
+  ['pagination-aware rescue', 'No more results'],
   ['validator command', 'node scripts/validate.mjs'],
+  ['test command', 'node --test'],
   ['hook rationale', 'Why the Claude Code hook family is not copied'],
 ];
 
 const README_SECTIONS = ['Install', 'Commands', 'Privacy', 'Uninstall'];
 
-// A marketplace catalog may only return together with the namespacing contract
-// documented: this section, stating what OMP rewrites. The check is section-scoped
-// so prose elsewhere in the README cannot satisfy it by accident.
+// Capabilities the README must name: each is a consumer-visible contract that a
+// reader cannot discover from the code alone. Patterns, not prose, so the words
+// can move without the contract moving.
+const README_REQUIREMENTS = [
+  ['direct-lane MCP server name', /`symvanta`\s+registers|server registers as `symvanta`/],
+  ['marketplace-lane MCP server name', /`symvanta:symvanta`/],
+  ['marketplace command names', /symvanta:symvanta-ask/],
+  ['stable command aliases', /\balias\w*/i],
+  ['default impact mode', /\bonce\b/],
+  ['strict impact mode', /\bstrict\b/],
+  ['warn impact mode', /\bwarn\b/],
+  ['observation-only status', /observation-only/i],
+  ['below-editor widget', /\bwidget\b/i],
+  ['guidance-only augmenters', /guidance[- ]only/i],
+  ['prompt guidance determinism', /\bdeterministic\b/i],
+  ['attachment gating', /attached/i],
+  ['unattached status', /not attached/i],
+  ['explorer agent', /symvanta-explorer/],
+  ['tracer agent', /symvanta-tracer/],
+  ['impact gate fails open', /fail(?:s)? open/i],
+];
+
+// The commands table must list every shipped command, so a command cannot be
+// documented only in passing.
+const COMMAND_TABLE_ROW = /^\|\s*`\/(symvanta-[a-z0-9-]+)\b/gm;
+
+// The namespacing section states what OMP rewrites. The check is section-scoped
+// so prose elsewhere in the README cannot satisfy it by accident, and it requires
+// both names because both lanes are documented in the same README.
 const MARKETPLACE_DOC_HEADING = '## Marketplace namespacing';
 const MARKETPLACE_DOC_REQUIREMENTS = [
   ['namespacing mechanism', /namespac\w*/i],
-  ['command names', /\bcommands?\b/],
-  ['MCP server name', /\bserver\b/],
+  ['namespaced command names', /symvanta:symvanta-/],
+  ['namespaced MCP server name', /symvanta:symvanta(?![-\w])/],
+  ['direct MCP server name', /`symvanta`/],
+  ['stable command aliases', /\balias\w*/i],
 ];
 
 // ------------------------------------------------------------------- project io
@@ -413,42 +584,49 @@ function sectionBody(text, heading) {
 }
 
 /**
- * This release ships no marketplace catalog, on purpose: a marketplace install
- * hands the plugin's commands and MCP server to OMP's namespace rewriting, so a
- * consumer would get names this README does not document. Any catalog path counts
- * (this repository's own, the Claude Code path a copy could drag in, or a root
- * one), and a catalog may only return once README.md documents that rewriting;
- * until then its presence is the violation, whatever the file contains.
+ * The release ships one marketplace catalog at .omp-plugin/marketplace.json, and
+ * the README must document the rewriting that install triggers (the namespacing
+ * section), because a marketplace consumer meets prefixed names while a direct
+ * Git consumer meets the plain ones. A catalog at any other known path is a
+ * second, undocumented lane and is rejected outright.
  */
 function checkCatalog(project, violations, pkg) {
-  const present = CATALOG_FILES.filter((rel) => project.read(rel) !== undefined);
-  if (present.length === 0) return;
-
-  const section = sectionBody(project.read('README.md'), MARKETPLACE_DOC_HEADING);
-  if (section === undefined) {
-    for (const rel of present) {
-      fail(
-        violations,
-        'catalog.namespace-docs',
-        `${rel} is back without namespace docs: README.md must carry a "${MARKETPLACE_DOC_HEADING}" section first, because a marketplace install rewrites the command and MCP server names this README documents`,
-      );
-    }
+  if (project.read(CATALOG_FILE) === undefined) {
+    fail(violations, 'catalog.missing', `${CATALOG_FILE} is missing: the marketplace lane needs a catalog`);
   } else {
-    for (const [label, pattern] of MARKETPLACE_DOC_REQUIREMENTS) {
-      if (!pattern.test(section)) {
-        fail(violations, 'catalog.namespace-docs', `README.md ${MARKETPLACE_DOC_HEADING} does not document the rewritten ${label}`);
-      }
+    checkCatalogEntry(project, violations, pkg, CATALOG_FILE);
+  }
+
+  for (const rel of STRAY_CATALOG_FILES) {
+    if (project.read(rel) !== undefined) {
+      fail(violations, 'catalog.path', `${rel} must not ship: this release publishes one catalog at ${CATALOG_FILE}`);
     }
   }
 
-  for (const rel of present) checkCatalogEntry(project, violations, pkg, rel);
+  const section = sectionBody(project.read('README.md'), MARKETPLACE_DOC_HEADING);
+  if (section === undefined) {
+    fail(
+      violations,
+      'catalog.namespace-docs',
+      `README.md must carry a "${MARKETPLACE_DOC_HEADING}" section: a marketplace install rewrites the command and MCP server names this README documents`,
+    );
+  } else {
+    for (const [label, pattern] of MARKETPLACE_DOC_REQUIREMENTS) {
+      if (!pattern.test(section)) {
+        fail(violations, 'catalog.namespace-docs', `README.md ${MARKETPLACE_DOC_HEADING} does not document the ${label}`);
+      }
+    }
+  }
 }
 
-/** Shape of one catalog file that returned: identity, plugin entry, and its source. */
+/** Shape of the catalog: marketplace identity, one plugin entry, and its source. */
 function checkCatalogEntry(project, violations, pkg, rel) {
   const catalog = readJson(project, rel, violations, 'catalog.json-invalid');
   if (catalog === undefined) return;
 
+  if (catalog.name !== MARKETPLACE_NAME) {
+    fail(violations, 'catalog.name', `${rel} name must be ${MARKETPLACE_NAME}, found ${JSON.stringify(catalog.name)}`);
+  }
   if (!validName(catalog.name, 64)) {
     fail(violations, 'catalog.name', `${rel} name ${JSON.stringify(catalog.name)} is not a valid marketplace name`);
   }
@@ -460,14 +638,26 @@ function checkCatalogEntry(project, violations, pkg, rel) {
   if (catalog.metadata !== undefined) {
     if (!isPlainObject(catalog.metadata)) {
       fail(violations, 'catalog.metadata', `${rel} metadata must be an object`);
-    } else if (catalog.metadata.pluginRoot !== undefined && typeof catalog.metadata.pluginRoot !== 'string') {
-      fail(violations, 'catalog.metadata', `${rel} metadata.pluginRoot must be a string`);
+    } else {
+      if (catalog.metadata.pluginRoot !== undefined && typeof catalog.metadata.pluginRoot !== 'string') {
+        fail(violations, 'catalog.metadata', `${rel} metadata.pluginRoot must be a string`);
+      }
+      if (catalog.metadata.version !== undefined && pkg !== undefined && catalog.metadata.version !== pkg.version) {
+        fail(
+          violations,
+          'catalog.metadata-version',
+          `${rel} metadata.version ${catalog.metadata.version} does not match package.json version ${pkg.version}`,
+        );
+      }
     }
   }
 
   if (!Array.isArray(catalog.plugins) || catalog.plugins.length === 0) {
     fail(violations, 'catalog.plugins', `${rel} plugins must be a non-empty array`);
     return;
+  }
+  if (catalog.plugins.length !== 1) {
+    fail(violations, 'catalog.plugins', `${rel} must list exactly one plugin (${PLUGIN_NAME}), found ${catalog.plugins.length}`);
   }
 
   for (const [index, entry] of catalog.plugins.entries()) {
@@ -495,12 +685,15 @@ function checkCatalogEntry(project, violations, pkg, rel) {
   if (!nonEmptyString(entry.description)) {
     fail(violations, 'catalog.plugin-description', `${rel} plugin entry ${PLUGIN_NAME} needs a description`);
   }
-  if (pkg !== undefined && entry.version !== undefined && entry.version !== pkg.version) {
+  if (pkg !== undefined && entry.version !== pkg.version) {
     fail(
       violations,
       'catalog.plugin-version',
-      `${rel} plugin entry version ${entry.version} does not match package.json version ${pkg.version}`,
+      `${rel} plugin entry version ${JSON.stringify(entry.version)} must match package.json version ${pkg.version}`,
     );
+  }
+  if (`${entry.name}@${catalog.name}`.length > 128) {
+    fail(violations, 'catalog.plugin-id', `${rel} plugin id ${entry.name}@${catalog.name} exceeds the 128-character limit`);
   }
 
   checkCatalogSource(project, violations, rel, entry.source);
@@ -718,6 +911,84 @@ function checkCommands(project, violations) {
   }
 }
 
+// ---------------------------------------------------------------------- agents
+
+/**
+ * Agent definitions are prompt contracts, so the checks are frontmatter shape,
+ * the declared tool set, and the read-only policy the descriptions promise. A
+ * declared tool that mutates the workspace, or an unknown tool name (which the
+ * host silently ignores), is a definition that does not do what it says.
+ */
+function checkAgents(project, violations) {
+  const files = markdownFiles(project, 'agents');
+  const names = files.map((name) => name.replace(/\.md$/, ''));
+
+  for (const expected of AGENTS) {
+    if (!names.includes(expected)) {
+      fail(violations, 'agent.set', `agents/${expected}.md is missing`);
+    }
+  }
+  for (const name of names) {
+    if (!AGENTS.includes(name)) {
+      fail(violations, 'agent.set', `agents/${name}.md is not part of the documented agent set`);
+    }
+    if (!/^symvanta-[a-z0-9-]+$/.test(name)) {
+      fail(violations, 'agent.name', `agents/${name}.md must be named symvanta-*`);
+    }
+  }
+
+  for (const file of files) {
+    const rel = `agents/${file}`;
+    const text = project.read(rel);
+    const parsed = parseFrontmatter(text);
+    if (parsed.error) {
+      fail(violations, 'agent.frontmatter', `${rel} ${parsed.error}`);
+      continue;
+    }
+
+    const expectedName = file.replace(/\.md$/, '');
+    if (parsed.data.name !== expectedName) {
+      fail(
+        violations,
+        'agent.frontmatter',
+        `${rel} frontmatter name must be ${expectedName}, found ${JSON.stringify(parsed.data.name)}`,
+      );
+    }
+    if (!nonEmptyString(parsed.data.description)) {
+      fail(violations, 'agent.description', `${rel} needs a non-empty description`);
+    }
+
+    const tools = parsed.data.tools;
+    if (tools !== undefined) {
+      const list = (Array.isArray(tools) ? tools : String(tools).split(','))
+        .map((tool) => String(tool).trim())
+        .filter((tool) => tool !== '');
+      if (list.length === 0) {
+        fail(violations, 'agent.tools', `${rel} declares an empty tool list`);
+      }
+      for (const tool of list) {
+        if (AGENT_FORBIDDEN_TOOLS.has(tool)) {
+          fail(violations, 'agent.read-only', `${rel} grants ${tool}; a Symvanta investigator is read-only`);
+        } else if (!AGENT_ALLOWED_TOOLS.has(tool)) {
+          fail(violations, 'agent.tools', `${rel} grants ${JSON.stringify(tool)}, which is not a known read-only tool`);
+        }
+      }
+      if (!list.includes('read')) {
+        fail(violations, 'agent.tools', `${rel} must grant read, or it cannot cite the local checkout`);
+      }
+    }
+
+    if (!/(?:read-only|never edit)/i.test(text)) {
+      fail(violations, 'agent.read-only', `${rel} must state that it never edits the checkout`);
+    }
+    if (!/\b(init|context|find_node|locate|relate|ask_codebase|map)\b/.test(parsed.body)) {
+      fail(violations, 'agent.graph-first', `${rel} does not direct the agent to the Symvanta graph tools`);
+    }
+
+    checkHostArtifacts(text, rel, violations, 'agent.host-ism', COMMAND_ISM_PATTERNS);
+  }
+}
+
 // ------------------------------------------------------------------------ skill
 
 function checkSkill(project, violations) {
@@ -743,43 +1014,65 @@ function checkSkill(project, violations) {
 // ---------------------------------------------------------------------- runtime
 
 function checkRuntime(project, violations) {
-  const source = project.read(EXTENSION_FILE);
-  if (source === undefined) {
-    fail(violations, 'runtime.missing', `${EXTENSION_FILE} is missing`);
-  } else {
-    for (const event of EXPECTED_EVENTS) {
-      if (!new RegExp(`["'\`]${event}["'\`]`).test(source)) {
-        fail(violations, 'runtime.event', `${EXTENSION_FILE} does not register a ${event} handler`);
-      }
+  const sources = new Map();
+  for (const rel of RUNTIME_MODULES) {
+    const text = project.read(rel);
+    if (text === undefined) {
+      fail(violations, 'runtime.missing', `${rel} is missing`);
+      continue;
     }
-    for (const token of EXPECTED_RUNTIME_TOKENS) {
-      if (!source.includes(token)) {
-        fail(violations, 'runtime.token', `${EXTENSION_FILE} does not reference ${token}`);
-      }
-    }
-    for (const [label, pattern] of EXPECTED_RUNTIME_PATTERNS) {
-      if (!pattern.test(source)) {
-        fail(violations, 'runtime.contract', `${EXTENSION_FILE} does not implement the ${label}`);
-      }
-    }
+    sources.set(rel, text);
+  }
 
-    const code = stripCodeComments(source);
-    for (const [label, pattern] of FORBIDDEN_RUNTIME_PATTERNS) {
+  const source = sources.get(EXTENSION_FILE);
+  if (source === undefined) return;
+
+  const combined = [...sources.values()].join('\n');
+  const combinedCode = stripCodeComments(combined);
+
+  for (const event of EXPECTED_EVENTS) {
+    if (!new RegExp(`["'\`]${event}["'\`]`).test(source)) {
+      fail(violations, 'runtime.event', `${EXTENSION_FILE} does not register a ${event} handler`);
+    }
+  }
+  for (const token of EXPECTED_RUNTIME_TOKENS) {
+    if (!combined.includes(token)) {
+      fail(violations, 'runtime.token', `the runtime does not reference ${token}`);
+    }
+  }
+  for (const [label, pattern] of EXPECTED_RUNTIME_PATTERNS) {
+    if (!pattern.test(combined)) {
+      fail(violations, 'runtime.contract', `the runtime does not implement the ${label}`);
+    }
+  }
+
+  // Every documented command must be an extension-registered alias: the alias is
+  // what keeps /symvanta-* working when a marketplace install prefixes the
+  // markdown commands with the plugin name.
+  for (const command of COMMANDS) {
+    if (!new RegExp(`["'\`]${command}["'\`]`).test(combined)) {
+      fail(violations, 'runtime.command-alias', `the extension does not register a ${command} alias`);
+    }
+  }
+
+  for (const [label, pattern] of FORBIDDEN_RUNTIME_PATTERNS) {
+    if (pattern.test(combinedCode)) {
+      fail(
+        violations,
+        'runtime.direct-access',
+        `the runtime performs a ${label}; MCP auth and transport stay inside OMP`,
+      );
+    }
+  }
+
+  for (const rel of PURE_MODULES) {
+    const text = sources.get(rel);
+    if (text === undefined) continue;
+    const code = stripCodeComments(text);
+    for (const [label, pattern] of PURE_MODULE_VIOLATIONS) {
       if (pattern.test(code)) {
-        fail(violations, 'runtime.direct-access', `${EXTENSION_FILE} performs a ${label}; MCP auth and transport stay inside OMP`);
+        fail(violations, 'runtime.module-purity', `${rel} performs a ${label}; pure helpers stay dependency-free`);
       }
-    }
-  }
-
-  const module = project.read(REPOSITORY_MODULE);
-  if (module === undefined) {
-    fail(violations, 'runtime.missing', `${REPOSITORY_MODULE} is missing`);
-    return;
-  }
-  const moduleCode = stripCodeComments(module);
-  for (const pattern of [/\bimport\b|\brequire\s*\(/, /\bprocess\.env/, /node:(?:fs|http|https|child_process)/]) {
-    if (pattern.test(moduleCode)) {
-      fail(violations, 'runtime.module-purity', `${REPOSITORY_MODULE} must stay dependency-free and pure`);
     }
   }
 }
@@ -806,11 +1099,41 @@ function checkReadme(project, violations) {
       fail(violations, 'readme.cli', `README.md does not document ${label} (${JSON.stringify(snippet)})`);
     }
   }
+  for (const [label, pattern] of README_REQUIREMENTS) {
+    if (!pattern.test(text)) {
+      fail(violations, 'readme.requirement', `README.md does not document the ${label}`);
+    }
+  }
   for (const command of COMMANDS) {
     if (!text.includes(`/${command}`)) {
       fail(violations, 'readme.command', `README.md does not document /${command}`);
     }
   }
+  const tabulated = new Set([...text.matchAll(COMMAND_TABLE_ROW)].map((match) => match[1]));
+  for (const command of COMMANDS) {
+    if (!tabulated.has(command)) {
+      fail(violations, 'readme.command-table', `README.md does not list /${command} in the commands table`);
+    }
+  }
+
+  // The hint a command declares is the hint a user types, so the README row must
+  // carry it: the table is the only place the spelling is published.
+  for (const file of markdownFiles(project, 'commands')) {
+    const rel = `commands/${file}`;
+    const parsed = parseFrontmatter(project.read(rel));
+    const hint = parsed.error ? undefined : parsed.data['argument-hint'];
+    if (!nonEmptyString(hint)) continue;
+    const name = file.replace(/\.md$/, '');
+    const escaped = String(hint).replace(/\|/g, '\\|');
+    if (!text.includes(`/${name} ${hint}`) && !text.includes(`/${name} ${escaped}`)) {
+      fail(
+        violations,
+        'readme.command-hint',
+        `README.md does not carry the declared argument hint for /${name} (${JSON.stringify(hint)})`,
+      );
+    }
+  }
+
   checkHostArtifacts(text, 'README.md', violations, 'readme.host-ism', README_ISM_PATTERNS);
 }
 
@@ -831,6 +1154,7 @@ export function collectViolations(project) {
   checkMcp(project, violations);
   checkRules(project, violations);
   checkCommands(project, violations);
+  checkAgents(project, violations);
   checkSkill(project, violations);
   checkRuntime(project, violations);
   checkReadme(project, violations);
@@ -849,7 +1173,7 @@ function main() {
   }
   console.log('Symvanta OMP plugin contract: OK');
   console.log(
-    '  package.json manifest, no marketplace catalog, MCP server, rule, commands, skill, extension, README',
+    '  package.json manifest, marketplace catalog, MCP server, rule, commands, agents, skill, extension modules, README',
   );
 }
 

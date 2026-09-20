@@ -1,7 +1,7 @@
 {
   "name": "@symvanta/omp-plugin",
-  "version": "0.1.0",
-  "description": "Symvanta code-graph routing for Oh My Pi: the MCP server definition, a hidden startup binding primer, and an always-apply navigation rule.",
+  "version": "0.2.0",
+  "description": "Symvanta code-graph routing for Oh My Pi: the MCP server definition, task agents, /symvanta-* commands, a session primer, an impact gate with selectable modes, and guidance-only augmenters.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -13,14 +13,16 @@
     "blast-radius"
   ],
   "files": [
-    "src",
-    "rules",
-    "commands",
-    "skills",
-    "scripts",
     ".mcp.json",
-    "README.md",
-    "LICENSE"
+    ".omp-plugin",
+    "agents",
+    "commands",
+    "rules",
+    "scripts",
+    "skills",
+    "src",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "validate": "node scripts/validate.mjs",

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "symvanta-omp",
+  "owner": {
+    "name": "Symvanta"
+  },
+  "metadata": {
+    "description": "Symvanta code-graph plugins for oh-my-pi.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "symvanta",
+      "description": "Symvanta code-graph MCP server, task agents, /symvanta-* commands, impact gating, and guidance-only augmenters for oh-my-pi.",
+      "version": "0.2.0",
+      "category": "development",
+      "source": "./"
+    }
+  ]
+}

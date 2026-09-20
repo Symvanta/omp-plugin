@@ -14,8 +14,10 @@ bare name either way.
 
 The plugin also ships user-invoked commands for the common runs: `/symvanta-ask`,
 `/symvanta-blast`, `/symvanta-trace`, `/symvanta-status`, `/symvanta-architecture`,
-`/symvanta-scope`, `/symvanta-tests`, and `/symvanta-working-tree`. They expand into
-the same tool calls described here, so reaching for one is never a detour.
+`/symvanta-scope`, `/symvanta-tests`, `/symvanta-working-tree`, `/symvanta-route`,
+`/symvanta-branch`, `/symvanta-recent`, and `/symvanta-clear`. They expand into the
+same tool calls described here, so reaching for one is never a detour. The last four
+cover the route, branch-pin, history, and unpin workflows in the matrix below.
 
 ## What the plugin wires up
 
@@ -106,7 +108,7 @@ right: say so and check `freshness` before relying further on the index.
 | Fuzzy or conceptual match | `locate` (mode:semantic) |
 | Unsure which mode | `locate` with no mode (text, then semantic) |
 | Cross-repo candidate scan | `locate` (mode:codebase) |
-| HTTP route handler | `find_http_route` |
+| HTTP route by path, optionally by method | `find_http_route` |
 | Who calls X | `relate` (kind:callers) |
 | What breaks if X changes | `relate` (kind:blast_radius) |
 | What X depends on | `relate` (kind:dependencies) |
@@ -121,10 +123,11 @@ right: say so and check `freshness` before relying further on the index.
 | Estimated size of a change | `estimate_scope` |
 | What a diff or branch breaks | `diff_impact` |
 | Uncommitted edits as queryable state | `ref` (op:index_working_tree) |
-| Pin reads to a branch | `ref` (op:use, then `clear`) |
+| Pin reads to a tracked branch | `ref` (op:use, then `clear`) |
+| Drop a revision pin, or unbind the project | `ref` (op:clear, op:clear_project) |
 | Record or read a decision | `adr` (op:record or list) |
 | Raw file, tree, blame, or diff with no local clone | `source` |
-| Commit history / recently changed | `history` |
+| Commit history / recently changed, optionally by path | `history` (op:commits, op:recently_changed) |
 | Library package or version facts | `library` |
 | Fast definition-only lookup of a name | `quick_lookup` |
 | Several independent lookups in one round-trip | `bundle` (locate, relate callers, find_node, list_file_symbols, find_http_route) |
