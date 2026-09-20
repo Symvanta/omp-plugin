@@ -175,7 +175,7 @@ editing the variable.
 ### Impact modes
 
 `SYMVANTA_IMPACT_MODE` selects how the pre-edit gate behaves. Values are trimmed
-and case-insensitive; an unknown value falls back to `once`.
+and case-insensitive; a missing, empty, or unknown value selects `once`.
 
 | Mode | Behavior |
 | --- | --- |
@@ -187,10 +187,6 @@ and case-insensitive; an unknown value falls back to `once`.
 ```
 export SYMVANTA_IMPACT_MODE=warn
 ```
-
-The older switch is still honored when `SYMVANTA_IMPACT_MODE` is absent or
-invalid: `SYMVANTA_ENFORCE_IMPACT=off` (also `false`, `0`, or `no`) selects
-`off`. An explicit valid `SYMVANTA_IMPACT_MODE` always wins.
 
 The gate is observed-attachment aware, because a user-wide install loads in
 checkouts Symvanta has never seen. It stays silent until a successful `init`
@@ -272,7 +268,7 @@ single pass that never rescans what it inserted.
 | `/symvanta-ask [question]` | Answer a behavior question ("how does X work", "why does Y happen", "what triggers Z") from the graph, with file citations. |
 | `/symvanta-blast [symbol or path:symbol]` | Blast-radius check before editing a symbol: what breaks across files, layers, and repositories. Satisfies the pre-edit gate. |
 | `/symvanta-trace [symbol]` | Trace a symbol: full call chain, direct callers, and dependencies, instead of reading files one by one. |
-| `/symvanta-status [repository (optional)]` | Connection and index health snapshot: bound project, indexed repositories, freshness, graph density, and MCP wiring. |
+| `/symvanta-status [repository (optional)]` | Connection and index health snapshot: bound project, indexed repositories, freshness, graph density, and MCP wiring. The pre-edit gate runs in-process inside the extension, so this snapshot cannot report it. |
 | `/symvanta-architecture [repository (optional)]` | High-level architecture of the indexed codebase: functional modules, their hubs, cross-module coupling, and the load-bearing functions. |
 | `/symvanta-scope [symbol or change description]` | Pre-flight scope estimate for a change before sizing or planning it, grounded in the graph instead of a guess at call sites. |
 | `/symvanta-tests [symbol]` | Find the existing tests that cover a symbol, from the graph rather than by guessing at test file names. |

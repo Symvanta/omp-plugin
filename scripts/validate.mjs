@@ -193,7 +193,6 @@ const EXPECTED_EVENTS = [
 const EXPECTED_RUNTIME_TOKENS = [
   'blast_radius',
   'estimate_scope',
-  'SYMVANTA_ENFORCE_IMPACT',
   'SYMVANTA_IMPACT_MODE',
   'SYMVANTA_AUGMENT',
   'index_health',
@@ -225,7 +224,6 @@ const EXPECTED_RUNTIME_PATTERNS = [
   ['home directory expansion', /\bhomedir\b/],
   ['impact-mode parser', /\bparseImpactMode\b/],
   ['impact-mode table', /\bIMPACT_MODES\b/],
-  ['legacy impact switch', /\bSYMVANTA_ENFORCE_IMPACT\b/],
   ['augment switch parser', /\baugmentEnabled\b/],
   ['augment dedupe switch', /SYMVANTA_AUGMENT_DEDUPE/],
   ['status observation reader', /\bstatusFromToolResult\b/],
@@ -296,7 +294,6 @@ const README_CLI_SNIPPETS = [
   ['MCP URL override', 'SYMVANTA_MCP_URL'],
   ['Cloud default URL', 'https://mcp.symvanta.com/mcp'],
   ['impact mode switch', 'SYMVANTA_IMPACT_MODE'],
-  ['legacy impact switch', 'SYMVANTA_ENFORCE_IMPACT'],
   ['augment switch', 'SYMVANTA_AUGMENT'],
   ['prompt augment switch', 'SYMVANTA_AUGMENT_PROMPT'],
   ['search augment switch', 'SYMVANTA_AUGMENT_SEARCH'],

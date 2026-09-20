@@ -45,7 +45,7 @@ On an attached, indexed repository (`workspace.attached` true; `list_repositorie
 
 - The graph returns paths and line bounds, not source. Open the file with `read` only after the graph names it, and read the range it points at.
 - For exact references, renames, and refactors, use `lsp` (references, rename, code actions). Those are compiler-accurate; regex renames silently miss callsites.
-- Before editing an existing code file, run the pre-edit impact check: `relate` with kind `blast_radius` for the symbol you are changing, or `estimate_scope` for a task-level estimate. The plugin's impact guard watches `edit`, `write`, and `apply_patch`: it refuses the first write to an existing code file in a session until one of those has run, then fails open, so one refusal disarms it for the rest of the session. SYMVANTA_ENFORCE_IMPACT=off disables it.
+- Before editing an existing code file, run the pre-edit impact check: `relate` with kind `blast_radius` for the symbol you are changing, or `estimate_scope` for a task-level estimate. The plugin's impact guard watches `edit`, `write`, and `apply_patch`: it refuses the first write to an existing code file in a session until one of those has run, then fails open, so one refusal disarms it for the rest of the session. `SYMVANTA_IMPACT_MODE=off` disables it.
 - Blast-radius threshold: always check before touching an exported or public symbol, anything with 3 or more callers, anything crossing a module or layer boundary, a route handler, or a shared type. A private helper with only a couple of local callers can go straight to the edit.
 - A change that removes, renames, or re-signatures a definition is never local: check `relate` (kind: callers) and update every callsite in the same pass.
 

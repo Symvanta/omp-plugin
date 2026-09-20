@@ -14,10 +14,7 @@
  *   off     do nothing at all
  *
  * SYMVANTA_IMPACT_MODE selects the mode. A value that names no mode, including
- * unset and empty, falls back to the legacy switch: SYMVANTA_ENFORCE_IMPACT in
- * {off, false, 0, no} maps to `off`, and anything else to `once`. That keeps an
- * existing `SYMVANTA_ENFORCE_IMPACT=off` in a shell profile working, while an
- * explicit SYMVANTA_IMPACT_MODE always wins.
+ * unset, empty, and unrecognized values, means `once`.
  *
  * This module is pure: it reads the environment object it is handed, imports
  * nothing, and performs no I/O. The extension parses the mode once per session
@@ -43,9 +40,8 @@ export function isOffValue(value) {
 }
 
 /**
- * The impact mode this session runs in. An explicit SYMVANTA_IMPACT_MODE wins
- * when it names a mode; otherwise the legacy switch decides, and its absence
- * means `once`.
+ * The impact mode this session runs in. SYMVANTA_IMPACT_MODE names it; when the
+ * variable is missing, empty, or names no mode, the session runs `once`.
  *
  * @param {Record<string, string | undefined> | undefined} env
  * @returns {"once" | "strict" | "warn" | "off"}
@@ -53,8 +49,7 @@ export function isOffValue(value) {
 export function parseImpactMode(env) {
   const source = env && typeof env === "object" ? env : {};
   const declared = typeof source.SYMVANTA_IMPACT_MODE === "string" ? source.SYMVANTA_IMPACT_MODE.trim().toLowerCase() : "";
-  if (IMPACT_MODES.includes(declared)) return declared;
-  return isOffValue(source.SYMVANTA_ENFORCE_IMPACT) ? "off" : "once";
+  return IMPACT_MODES.includes(declared) ? declared : "once";
 }
 
 /** Whether this mode can refuse a mutation at all. */

@@ -619,8 +619,7 @@ function readTarget(input: unknown, cwd: string): string | null {
 
 /**
  * The refusal the guard returns, phrased for the mode that produced it: `once`
- * stops after one, `strict` keeps refusing until a check completes, and the
- * legacy SYMVANTA_ENFORCE_IMPACT=off alias maps to the off mode.
+ * stops after one, `strict` keeps refusing until a check completes.
  */
 function blockReason(relativePath: string, tools: ToolAvailability, mode: ImpactMode): string {
   const options: string[] = [];
@@ -630,7 +629,7 @@ function blockReason(relativePath: string, tools: ToolAvailability, mode: Impact
 
   const cap = mode === "strict"
     ? "This session runs SYMVANTA_IMPACT_MODE=strict, so the guard keeps refusing until that check completes."
-    : "This guard stops refusing after its first refusal; SYMVANTA_IMPACT_MODE=strict keeps refusing instead, warn advises without blocking, and off disables the guard (the legacy SYMVANTA_ENFORCE_IMPACT=off maps to off).";
+    : "This guard stops refusing after its first refusal; SYMVANTA_IMPACT_MODE=strict keeps refusing instead, warn advises without blocking, and off disables the guard.";
 
   return [
     `Symvanta impact guard: ${relativePath} already exists and no Symvanta impact check has run in this session.`,

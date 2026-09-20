@@ -41,7 +41,6 @@ const DOCUMENTED_COMMANDS = [
 
 const SWITCH_KEYS = [
   "SYMVANTA_IMPACT_MODE",
-  "SYMVANTA_ENFORCE_IMPACT",
   "SYMVANTA_AUGMENT",
   "SYMVANTA_AUGMENT_PROMPT",
   "SYMVANTA_AUGMENT_SEARCH",
@@ -232,24 +231,18 @@ const EDIT_OTHER = { path: "src/other.ts", content: "export const other = 3;\n" 
 
 // ------------------------------------------------------------ pure switch parsing
 
-test("parseImpactMode reads the documented modes and maps the legacy switch", () => {
+test("parseImpactMode reads the documented modes and selects once for a missing, empty, or invalid value", () => {
   assert.deepEqual([...IMPACT_MODES], ["once", "strict", "warn", "off"]);
 
   assert.equal(parseImpactMode({}), "once", "the default is once");
   assert.equal(parseImpactMode(undefined), "once", "a missing environment is the default");
-  assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: "strict" }), "strict");
+  assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: "" }), "once", "an empty value selects once");
+  assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: "   " }), "once", "a blank value selects once");
+  assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: "sometimes" }), "once", "an unknown value selects once");
+  for (const mode of ["once", "strict", "warn", "off"]) {
+    assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: mode }), mode, `the ${mode} mode is read`);
+  }
   assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: "  WARN " }), "warn", "values are trimmed and case-insensitive");
-  assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: "off" }), "off");
-  assert.equal(parseImpactMode({ SYMVANTA_IMPACT_MODE: "sometimes" }), "once", "an unknown value falls back to once");
-  assert.equal(parseImpactMode({ SYMVANTA_ENFORCE_IMPACT: "off" }), "off", "the legacy switch still maps to off");
-  assert.equal(parseImpactMode({ SYMVANTA_ENFORCE_IMPACT: "false" }), "off");
-  assert.equal(parseImpactMode({ SYMVANTA_ENFORCE_IMPACT: "1" }), "once", "only off values disable the legacy switch");
-  assert.equal(
-    parseImpactMode({ SYMVANTA_IMPACT_MODE: "strict", SYMVANTA_ENFORCE_IMPACT: "off" }),
-    "strict",
-    "an explicit mode wins over the legacy switch",
-  );
-
   assert.ok(isOffValue("NO"));
   assert.ok(!isOffValue("on"));
   assert.equal(impactBlockLimit("once", 1), 1);
@@ -460,7 +453,7 @@ test("warn mode advises instead of refusing, once per file", async () => {
   });
 });
 
-test("off mode refuses nothing and says nothing, and an explicit mode wins over the legacy switch", async () => {
+test("off mode refuses nothing and says nothing", async () => {
   await withSwitches({ SYMVANTA_IMPACT_MODE: "off" }, async () => {
     const app = harness();
     await app.start();
@@ -470,19 +463,15 @@ test("off mode refuses nothing and says nothing, and an explicit mode wins over 
     assert.deepEqual(app.notifications, []);
   });
 
-  await withSwitches({ SYMVANTA_ENFORCE_IMPACT: "off" }, async () => {
-    const app = harness();
-    await app.start();
-    const [allowed] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
-    assert.equal(allowed, undefined, "the legacy switch still disables the guard");
-  });
-
-  await withSwitches({ SYMVANTA_IMPACT_MODE: "strict", SYMVANTA_ENFORCE_IMPACT: "off" }, async () => {
-    const app = harness();
-    await app.start();
-    const [blocked] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
-    assert.equal(blocked?.block, true, "an explicit mode wins over the legacy switch");
-  });
+  // A value that names no mode selects once, so the guard is still armed.
+  for (const declared of ["", "  ", "sometimes"]) {
+    await withSwitches({ SYMVANTA_IMPACT_MODE: declared }, async () => {
+      const app = harness();
+      await app.start();
+      const [blocked] = await app.emit("tool_call", { toolName: "edit", input: EDIT_APP, toolCallId: "e1" });
+      assert.equal(blocked?.block, true, `"${declared}" selects once, which refuses the first write`);
+    });
+  }
 });
 
 test("the gate fails open when the graph is unreachable, and passes new or non-code files", async () => {
@@ -503,7 +492,7 @@ test("the gate fails open when the graph is unreachable, and passes new or non-c
   });
 });
 
-test("a new session re-arms the gate and the legacy wire names still count as the check", async () => {
+test("a new session re-arms the gate and the namespaced MCP wire names still count as the check", async () => {
   await withSwitches({}, async () => {
     const app = harness();
     await app.start();

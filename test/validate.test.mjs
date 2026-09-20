@@ -584,7 +584,6 @@ test("a runtime that drops a capability token is rejected", () => {
   const tokens = [
     "blast_radius",
     "estimate_scope",
-    "SYMVANTA_ENFORCE_IMPACT",
     "SYMVANTA_IMPACT_MODE",
     "SYMVANTA_AUGMENT",
     "index_health",
@@ -755,7 +754,6 @@ test("README drift for a capability contract is rejected", () => {
   const readme = read("README.md");
   const cases = [
     ["impact mode switch", "SYMVANTA_IMPACT_MODE", "readme.cli"],
-    ["legacy impact switch", "SYMVANTA_ENFORCE_IMPACT", "readme.cli"],
     ["augment switch", "SYMVANTA_AUGMENT", "readme.cli"],
     ["search augment switch", "SYMVANTA_AUGMENT_SEARCH", "readme.cli"],
     ["dedupe augment switch", "SYMVANTA_AUGMENT_DEDUPE", "readme.cli"],
@@ -1104,7 +1102,6 @@ test("the runtime never speaks HTTP itself, never reads credentials, and reads o
   // The only environment reads are the documented switches; a credential-bearing
   // variable would have to be named here to pass.
   const allowedEnv = new Set([
-    "SYMVANTA_ENFORCE_IMPACT",
     "SYMVANTA_IMPACT_MODE",
     "SYMVANTA_AUGMENT",
     "SYMVANTA_AUGMENT_PROMPT",

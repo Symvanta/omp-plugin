@@ -46,9 +46,8 @@ Two behaviors belong to the extension itself, not to any tool call you make:
   It is fail-open: if no `relate` / `estimate_scope` definition is loaded, or any
   internal error occurs, the write proceeds. A successful `relate` (kind:blast_radius)
   or `estimate_scope` disarms it for the rest of the session, and one block disarms it
-  too, so a session can never stall. `SYMVANTA_ENFORCE_IMPACT` set to `off`, `false`,
-  `0`, or `no` (trimmed, case-insensitive) turns it off; unset or anything else leaves
-  it on. The block reason names the raw tool calls, and because slash commands are not
+  too, so a session can never stall. `SYMVANTA_IMPACT_MODE=off` turns it off. The
+  block reason names the raw tool calls, and because slash commands are not
   model-callable it points the user at `/symvanta-blast`. New files and non-code files
   are never gated.
 
