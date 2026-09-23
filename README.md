@@ -235,24 +235,15 @@ already reported in this session: bound repository, index freshness, and indexed
 repository count. A `workspace.attached: false` result shows as `not attached`.
 The widget changes nothing about agent behavior.
 
-## What runs in the session
+## Runtime notes
 
-The plugin is a rule, twelve commands, two agents, a skill, and an extension
-(`src/index.ts`) with five helper modules (`src/commands.js`, `src/repository.js`,
-`src/impact.js`, `src/augment.js`, `src/status.js`). The extension:
-
-- reads the checkout's git remote at session start and injects the `init`
-  binding, then re-runs that setup for `/new`;
-- refuses edits per `SYMVANTA_IMPACT_MODE` and counts an impact check only when
-  it completed successfully;
-- feeds the widget from `init`, `freshness`, and `index_health` results;
-- clears its state at shutdown.
+The extension reads the checkout's git remote at session start to build the
+`init` binding, repeats that setup for `/new` (an empty transcript in the same
+process), and clears its state at shutdown.
 
 Symvanta tool names resolve from host metadata, or from the wire name once
 `mcp__` and any repeated server token are stripped, so `mcp__symvanta_relate`,
-`mcp__symvanta__relate`, and `mcp__symvanta_symvanta_relate` all work. The
-always-apply rule (`rule://symvanta`) carries the standing policy and the
-`symvanta` skill holds the full tool decision matrix.
+`mcp__symvanta__relate`, and `mcp__symvanta_symvanta_relate` all work.
 
 ### XD write devices
 
