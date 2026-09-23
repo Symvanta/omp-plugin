@@ -21,8 +21,7 @@
 //               tool-name resolution, no credential reads, no direct HTTP and no fetch
 //   impact.*    no reference to the removed legacy impact switch anywhere in a shipped artifact
 //   readme.*    README documents both install lanes and their names, the impact modes, the
-//               agents, the augmenters, the observation-only widget, OAuth, reload, privacy,
-//               and the hook rationale
+//               agents, the augmenters, the observation-only widget, OAuth, reload, and privacy
 //   host.*      no Claude-only wiring reference in a shipped artifact
 //   hooks.*     no Claude Code hooks.json (OMP wires hooks as extension events)
 //
@@ -321,7 +320,6 @@ const README_CLI_SNIPPETS = [
   ['pagination-aware rescue', 'No more results'],
   ['validator command', 'node scripts/validate.mjs'],
   ['test command', 'node --test'],
-  ['hook rationale', 'Why the Claude Code hook family is not copied'],
 ];
 
 const README_SECTIONS = ['Install', 'Commands', 'Privacy', 'Uninstall'];

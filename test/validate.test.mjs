@@ -732,22 +732,23 @@ test("a missing README is rejected", () => {
   expectCode(violationsFor({ "README.md": undefined }), "readme.missing");
 });
 
-test("README still documents OAuth, reload, privacy, and the hook rationale", () => {
+test("README still documents OAuth, reload, and privacy", () => {
   const readme = read("README.md");
   const required = [
     ["OAuth sign-in", /\bOAuth\b/],
     ["plugin reload", /\/reload-plugins/],
     ["privacy statement", /^## Privacy\b/m],
-    ["hook rationale", /hook/i],
   ];
 
   for (const [label, pattern] of required) {
     assert.match(readme, pattern, `README.md must document ${label}`);
   }
 
-  const noHooks = readme.replace(/hooks?/gi, "extensions");
-  assert.notEqual(noHooks, readme, "README.md must document the hook rationale");
-  expectCode(violationsFor({ "README.md": noHooks }), "readme.cli");
+  const noTest = readme.replaceAll("node --test", "bun test");
+  assert.notEqual(noTest, readme, "README.md must document the test command");
+  assert.doesNotMatch(noTest, /node --test/, "the drift must remove the test command");
+  expectCode(violationsFor({ "README.md": noTest }), "readme.cli");
+  assert.deepEqual(violationsFor({ "README.md": readme }), [], "the unmutated README must produce no violations");
 });
 
 test("README drift for a capability contract is rejected", () => {
